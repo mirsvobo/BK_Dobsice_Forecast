@@ -9,7 +9,7 @@ from hierarchicalforecast.methods import BottomUp
 import config
 import warnings
 import logging
-import torch # NOVÝ IMPORT PRO KONTROLU CUDA
+import torch
 
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 warnings.filterwarnings('ignore')
@@ -23,9 +23,11 @@ class ForecastModel:
         self.params = best_params if best_params else config.TFT_PARAMS
 
     def _build_models_list(self):
+        # Použijeme parametry z Optuny nebo default z configu
         h_size = self.params.get('hidden_size', config.TFT_PARAMS['hidden_size'])
         lr = self.params.get('learning_rate', config.TFT_PARAMS['learning_rate'])
         drp = self.params.get('dropout', 0.1)
+        bs = self.params.get('batch_size', config.TFT_PARAMS['batch_size'])
 
         models = []
         models.append(
@@ -33,12 +35,10 @@ class ForecastModel:
                 h=config.TFT_PARAMS['h'],
                 input_size=config.TFT_PARAMS['input_size'],
 
-                # Parametry tréninku
                 max_steps=config.TFT_PARAMS['max_steps'],
                 early_stop_patience_steps=config.TFT_PARAMS['early_stop_patience_steps'],
-                batch_size=config.TFT_PARAMS['batch_size'],
+                batch_size=bs,
 
-                # Architektura
                 hidden_size=h_size,
                 learning_rate=lr,
                 dropout=drp,
@@ -49,35 +49,28 @@ class ForecastModel:
                 futr_exog_list=config.FUTR_EXOG_LIST,
                 alias='TFT_Model',
 
-                # Konfigurace GPU musí být zde
+                # Všechny GPU parametry (včetně mixed precision)
                 **config.TRAINER_KWARGS
             )
         )
         return models
 
     def train(self, df_sales, df_guests):
-
-        # --- KONTROLA A VYNUCENÍ GPU ARCHITEKTURY ---
-        # Tato sekce řeší chybu "no kernel image is available" pro novou řadu 50xx.
+        # Fix pro kompatibilitu RTX řady 50xx, pokud by zlobila
         if config.TRAINER_KWARGS.get('accelerator') == 'gpu' and torch.cuda.is_available():
-            # Použijeme architekturu sm_89 (RTX 40xx), která je kompatibilní s řadou 50xx a je PyTorchi známá.
             if not os.environ.get('TORCH_CUDA_ARCH_LIST'):
                 os.environ['TORCH_CUDA_ARCH_LIST'] = "8.9"
-                print("Vynuceno TORCH_CUDA_ARCH_LIST=8.9 pro řešení konfliktu binárního kódu.")
 
-        print("\nINFO: Startuji trénink modelu (GPU Powered 🚀)...")
+        print("\nINFO: Startuji trénink finálního modelu (GPU Powered 🚀)...")
 
-        # Nastavení validační sady pro Early Stopping. 168 hodin = 7 dní.
         val_size = 168
 
-        # Sales
         self.nf_sales = NeuralForecast(
             models=self._build_models_list(),
             freq=config.FREQ
         )
         self.nf_sales.fit(df=df_sales, val_size=val_size)
 
-        # Guests
         self.nf_guests = NeuralForecast(
             models=self._build_models_list(),
             freq=config.FREQ
@@ -88,15 +81,12 @@ class ForecastModel:
 
     def predict(self, future_df, S, tags):
         print(f"INFO: Generuji predikci...")
-        # Predikce
         p_sales = self.nf_sales.predict(futr_df=future_df)
         p_guests = self.nf_guests.predict(futr_df=future_df)
 
-        # Přejmenování
         p_sales = self._rename_output_columns(p_sales)
         p_guests = self._rename_output_columns(p_guests)
 
-        # Rekonciliace
         final_sales = self._reconcile_detailed(p_sales, S, tags)
         final_guests = self._reconcile_detailed(p_guests, S, tags)
 

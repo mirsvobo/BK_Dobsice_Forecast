@@ -1,9 +1,14 @@
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# --- CONFIG PAMĚTI ---
+# Nastavíme to, ale VOLAT torch.cuda NEBUDEME
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import time
+import gc
+# import torch  <-- Tady to sice importujeme, ale nesmíme volat funkce na GPU
 
 # Vlastní moduly
 import config
@@ -25,7 +30,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🍔 Burger King Dobšice: AI Forecast")
-st.markdown(f"**Engine:** NeuralForecast (TFT) | **Hardware:** GPU Enabled 🚀")
+st.markdown(f"**Engine:** NeuralForecast (TFT) | **Hardware:** RTX 5070 (Process Isolation) 🚀")
 
 # --- SIDEBAR ---
 st.sidebar.header("⚙️ Nastavení")

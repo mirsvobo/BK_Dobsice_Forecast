@@ -17,81 +17,51 @@ LON_COLUMN = 'Restaurant[Longitude]'
 
 # --- 3. Konfigurace prognózy ---
 TRAIN_START_DATE = '2023-01-01'
-# Uprav dle potřeby
 FORECAST_START = '2025-11-01 00:00:00'
 FORECAST_END = '2025-11-30 23:00:00'
 FREQ = 'h'
 
-# --- 4. Parametry Modelů ---
-# Nastavení pro tvůj HW (RTX 5070 + Ryzen)
-TRAINER_KWARGS = {
-    'accelerator': 'gpu',  # Vynutí NVIDIA GPU
-    'devices': 1,          # Použije 1 kartu
-    'enable_model_summary': True,
-    'strategy': 'auto'
-}
-
 TFT_PARAMS = {
-    'h': 24,                # Horizont modelu (krok predikce)
-    'input_size': 168,      # 7 dní zpět
-    'max_steps': 1000,      # Hlavní parametr délky tréninku
-    'early_stop_patience_steps': 15, # Zastaví, pokud se 15 kroků nezlepší
+    'h': 24,
+    'input_size': 168,
+    'max_steps': 1000,
+    'early_stop_patience_steps': 15,
     'learning_rate': 0.001,
     'hidden_size': 64,
-    'batch_size': 32,      # Zvýšeno pro RTX 5070
+    'batch_size': 64,      # 64 je pro 5070 v pohodě
     'scaler_type': 'robust',
-    'num_workers': 7
+    'num_workers': 0       # Na Windows nechat 0
 }
 
-# --- 5. Seznam Features (Exogenní proměnné) ---
+TRAINER_KWARGS = {
+    'accelerator': 'gpu',
+    'devices': 1,
+    'enable_model_summary': False, # Vypnout pro čistší logy
+    'enable_progress_bar': False,
+    'precision': '16-mixed'
+}
+
+# --- 5. Features ---
 FUTR_EXOG_LIST = [
-    'sin_hour', 'cos_hour',
-    'sin_day', 'cos_day',
-    'is_peak_lunch',
-    'is_peak_dinner',
-    'is_holiday',
-    'is_weekend',
-    'is_payday_week',
-    'is_long_weekend',
+    'sin_hour', 'cos_hour', 'sin_day', 'cos_day',
+    'is_peak_lunch', 'is_peak_dinner',
+    'is_holiday', 'is_weekend',
+    'is_payday_week', 'is_long_weekend',
     'is_school_holiday',
-    'is_event_rfp',
-    'is_event_vp',
-    'is_event_ba',
-    'is_event_ap',
-    'is_competitor_closed'
+    'is_event_rfp', 'is_event_vp', 'is_event_ba',
+    'is_event_ap', 'is_competitor_closed'
 ]
 
 # --- 6. Business Logika ---
 PEAK_HOURS_LUNCH = [11, 12, 13, 14]
 PEAK_HOURS_DINNER = [17, 18, 19, 20]
 
-# --- 7. KALENDÁŘ UDÁLOSTÍ (EVENTS) ---
+# --- 7. Events ---
 EVENT_KFC_CLOSED = ('2024-10-01', '2024-10-31')
-
-EVENT_ROCK_FOR_PEOPLE = [
-    ('2023-06-07', '2023-06-12'),
-    ('2024-06-11', '2024-06-16'),
-    ('2025-06-10', '2025-06-15')
-]
-
-EVENT_VELKA_PARDUBICKA = [
-    ('2023-10-07', '2023-10-08'),
-    ('2024-10-12', '2024-10-13'),
-    ('2025-10-11', '2025-10-12')
-]
-
-EVENT_BRUTAL_ASSAULT = [
-    ('2023-08-09', '2023-08-13'),
-    ('2024-08-07', '2024-08-11'),
-    ('2025-08-06', '2025-08-10')
-]
-
-EVENT_AVIATICKA_POUT = [
-    ('2023-05-27', '2023-05-28'),
-    ('2024-06-01', '2024-06-02'),
-    ('2025-05-31', '2025-06-01')
-]
-
+EVENT_ROCK_FOR_PEOPLE = [('2023-06-07', '2023-06-12'), ('2024-06-11', '2024-06-16'), ('2025-06-10', '2025-06-15')]
+EVENT_VELKA_PARDUBICKA = [('2023-10-07', '2023-10-08'), ('2024-10-12', '2024-10-13'), ('2025-10-11', '2025-10-12')]
+EVENT_BRUTAL_ASSAULT = [('2023-08-09', '2023-08-13'), ('2024-08-07', '2024-08-11'), ('2025-08-06', '2025-08-10')]
+EVENT_AVIATICKA_POUT = [('2023-05-27', '2023-05-28'), ('2024-06-01', '2024-06-02'), ('2025-05-31', '2025-06-01')]
 SCHOOL_HOLIDAYS = [
     ('2023-02-06', '2023-03-19'), ('2023-04-06', '2023-04-10'),
     ('2023-07-01', '2023-09-03'), ('2023-10-26', '2023-10-29'),
