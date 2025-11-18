@@ -36,4 +36,3 @@ def check_package_versions():
 
 if __name__ == "__main__":
     check_package_versions()
-    check_package_versions()

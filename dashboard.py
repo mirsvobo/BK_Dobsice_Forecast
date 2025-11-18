@@ -1,10 +1,10 @@
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import time
 
-import os
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 # Vlastní moduly
 import config
 from dataloader import DataLoader

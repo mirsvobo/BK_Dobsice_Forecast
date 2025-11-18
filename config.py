@@ -25,7 +25,7 @@ FREQ = 'h'
 # --- 4. Parametry Modelů ---
 # Nastavení pro tvůj HW (RTX 5070 + Ryzen)
 TRAINER_KWARGS = {
-    'accelerator': 'auto',  # Vynutí NVIDIA GPU
+    'accelerator': 'gpu',  # Vynutí NVIDIA GPU
     'devices': 1,          # Použije 1 kartu
     'enable_model_summary': True,
     'strategy': 'auto'
@@ -33,12 +33,12 @@ TRAINER_KWARGS = {
 
 TFT_PARAMS = {
     'h': 24,                # Horizont modelu (krok predikce)
-    'input_size': 128,      # 7 dní zpět
+    'input_size': 168,      # 7 dní zpět
     'max_steps': 1000,      # Hlavní parametr délky tréninku
     'early_stop_patience_steps': 15, # Zastaví, pokud se 15 kroků nezlepší
     'learning_rate': 0.001,
     'hidden_size': 64,
-    'batch_size': 64,      # Zvýšeno pro RTX 5070
+    'batch_size': 32,      # Zvýšeno pro RTX 5070
     'scaler_type': 'robust',
     'num_workers': 7
 }
