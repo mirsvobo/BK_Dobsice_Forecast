@@ -31,36 +31,53 @@ class ForecastModel:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             gc.collect()
-            print(f"   [ForecastModel] GPU: {torch.cuda.get_device_name(0)} | Batch: {self.params['batch_size']} | H: {self.params['h']}")
+            print(f"   [ForecastModel] GPU: {torch.cuda.get_device_name(0)} | Batch: {self.params['batch_size']} | Steps Limit: {self.params['max_steps']}")
 
     def _build_models_list(self):
+        # --- FIX: Obejítí chyby s ignorováním max_steps ---
+        trainer_args = {
+            'max_steps': self.params['max_steps'], # Zde se definuje limit!
+            'accelerator': self.accelerator,
+            'enable_model_summary': False,
+            'enable_progress_bar': True,
+            'check_val_every_n_epoch': 1
+        }
+
         tft_model = TFT(
             h=self.params['h'],
             input_size=self.params['input_size'],
-            max_steps=self.params['max_steps'],
+
+            # Parametry modelu
             hidden_size=self.params['hidden_size'],
             learning_rate=self.params['learning_rate'],
             scaler_type=self.params['scaler_type'],
             batch_size=self.params['batch_size'],
+            dropout=self.params['dropout'], # Přidán dropout
             loss=self.loss,
             futr_exog_list=config.FUTR_EXOG_LIST,
             alias='TFT_Model',
-            accelerator=self.accelerator,
-            precision="16-mixed",
-            enable_model_summary=False
+
+            # Early Stopping (Model level)
+            early_stop_patience_steps=self.params['early_stop_patience_steps'],
+
+            # Trainer parametry posíláme tudy
+            trainer_kwargs=trainer_args
         )
+
+        # Windows Fix
         tft_model.num_workers_loader = 0
         tft_model.drop_last_loader = False
+
         return [tft_model]
 
     def train(self, df_sales, df_guests):
-        print(f"INFO: Startuji trénink (Sales)...")
+        print(f"INFO: Startuji trénink (Sales). Limit kroků: {self.params['max_steps']}...")
         self.nf_sales = NeuralForecast(models=self._build_models_list(), freq=config.FREQ)
         self.nf_sales.fit(df=df_sales, val_size=self.params['h'])
 
         torch.cuda.empty_cache()
 
-        print(f"INFO: Startuji trénink (Guests)...")
+        print(f"INFO: Startuji trénink (Guests). Limit kroků: {self.params['max_steps']}...")
         self.nf_guests = NeuralForecast(models=self._build_models_list(), freq=config.FREQ)
         self.nf_guests.fit(df=df_guests, val_size=self.params['h'])
 

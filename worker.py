@@ -4,14 +4,20 @@ import logging
 import warnings
 import os
 
+# --- 1. POTLAČENÍ VAROVÁNÍ (SILENCE WARNINGS) ---
+# Potlačení hlášky "No runtime found" od Streamlitu v podprocesech
+logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.ERROR)
+logging.getLogger("streamlit.runtime.scriptrunner.script_run_context").setLevel(logging.ERROR)
+logging.getLogger("streamlit").setLevel(logging.ERROR)
+
+# Potlačení Lightning a Torch varování
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+warnings.filterwarnings('ignore')
+
 # Nutné importy pro proces
 from neuralforecast import NeuralForecast
 from neuralforecast.models import TFT
 from neuralforecast.losses.pytorch import HuberMQLoss
-
-# Potlačení logů v procesu
-logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
-warnings.filterwarnings('ignore')
 
 def train_process_worker(params, train_data_dict, horizon, queue):
     """
@@ -23,10 +29,10 @@ def train_process_worker(params, train_data_dict, horizon, queue):
         if 'ds' in train_df.columns:
             train_df['ds'] = pd.to_datetime(train_df['ds'])
 
-        # 2. Definice Modelu (Musí být lehký a rychlý)
+        # 2. Definice Modelu
         model = TFT(
             h=horizon,
-            input_size=60, # Fixní pro optunu (nebo params['input_size'] pokud bychom ladili i to)
+            input_size=params.get('input_size', 60), # Fallback kdyby chybělo
             hidden_size=params['hidden_size'],
             learning_rate=params['learning_rate'],
             dropout=params['dropout'],
@@ -38,7 +44,7 @@ def train_process_worker(params, train_data_dict, horizon, queue):
 
             # --- GPU OPTIMALIZACE ---
             accelerator="gpu",
-            precision="16-mixed", # Šetří paměť
+            precision="16-mixed",
 
             # --- WINDOWS FIX ---
             num_workers_loader=0,
@@ -51,13 +57,13 @@ def train_process_worker(params, train_data_dict, horizon, queue):
         model.num_workers_loader = 0
 
         # 3. Trénink
-        nf = NeuralForecast(models=[model], freq='D') # Důležité: 'D' pro denní
+        nf = NeuralForecast(models=[model], freq='D')
 
         try:
             # Fit
             nf.fit(df=train_df)
 
-            # Rychlý odhad chyby (validace na posledním okně)
+            # Rychlý odhad chyby
             cv_df = nf.cross_validation(df=train_df, n_windows=1, step_size=horizon)
             mae = (cv_df['y'] - cv_df['TFT_Optuna']).abs().mean()
 

@@ -17,28 +17,30 @@ RESTAURANT_META = {
     'Delivery_Date': '2021-03-12'
 }
 
-# --- 3. Mapování sloupců ---
+# --- 3. Mapování ---
 DATE_COLUMN = 'Calendar Date'
 SALES_COLUMN = 'CK - Sales Net'
 GUESTS_COLUMN = 'CK - Guests'
 CHANNEL_COLUMN = 'Sales Channel'
 
-# --- 4. Konfigurace prognózy (DENNÍ) ---
+# --- 4. Konfigurace prognózy ---
 TRAIN_START_DATE = '2021-02-01'
 FREQ = 'D'
 
-# --- 5. Parametry modelu (TFT) ---
+# --- 5. PARAMETRY MODELU (GOLD STANDARD) ---
 TFT_PARAMS = {
-    'h': 60,
-    'input_size': 120,
-    'max_epochs': 500,
-    'max_steps': 15000,
-    'early_stop_patience_steps': 10,
-    'learning_rate': 0.0005,
-    'hidden_size': 128,
-    'batch_size': 128,
-    'scaler_type': 'robust',
-    'dropout': 0.1,
+    'h': 60,                        # Předpověď na 2 měsíce
+    'input_size': 120,              # Vidí 4 měsíce historie
+
+    # Limit tréninku (cca 50 epoch)
+    'max_steps': 3500,
+    'early_stop_patience_steps': 15, # Zastaví, když se 15x po sobě nezlepší
+
+    'learning_rate': 0.0005,        # Pomalejší, ale přesnější učení
+    'hidden_size': 128,             # Velký mozek (využije VRAM)
+    'batch_size': 128,              # Rychlé ládování dat
+    'scaler_type': 'robust',        # Odolné proti extrémům (Vánoce)
+    'dropout': 0.2,                 # Vyšší dropout, aby se model nepře-učil
     'attn_head_size': 4,
 }
 
@@ -47,7 +49,7 @@ TRAINER_KWARGS = {
     'devices': 1,
 }
 
-# --- 6. Features (Příznaky) ---
+# --- 6. Features ---
 FUTR_EXOG_LIST = [
     'sin_day', 'cos_day',
     'is_holiday', 'is_weekend',
@@ -56,25 +58,16 @@ FUTR_EXOG_LIST = [
     'is_event_rfp', 'is_event_vp', 'is_event_ba',
     'is_event_ap', 'is_competitor_closed',
     'is_covid_restriction',
-
-    # --- NOVÉ VÁNOČNÍ FEATURES ---
-    'is_closed',       # Pro 24. a 25. 12.
-    'is_short_open'    # Pro 26. a 31. 12.
+    'is_closed',
+    'is_short_open'
 ]
 
-# --- 7. Business Logika & Eventy ---
-
-# Generátor vánočních dat pro roky 2021-2026
-# Aby se model naučil z historie, že se to opakuje každý rok
+# --- 7. Business Logika ---
 CHRISTMAS_CLOSED = []
 CHRISTMAS_SHORT = []
-
 for year in range(2021, 2027):
-    # 24. a 25. Zavřeno
     CHRISTMAS_CLOSED.append((f'{year}-12-24', f'{year}-12-25'))
-    # 26. Omezeno
     CHRISTMAS_SHORT.append((f'{year}-12-26', f'{year}-12-26'))
-    # 31. Silvestr Omezeno
     CHRISTMAS_SHORT.append((f'{year}-12-31', f'{year}-12-31'))
 
 EVENT_KFC_CLOSED = ('2024-10-01', '2024-10-31')
@@ -100,7 +93,6 @@ COVID_RESTRICTIONS = [
     ('2021-11-26', '2021-12-25'),
     ('2022-01-01', '2022-02-18')
 ]
-
 WEATHER_PARAMS = {
     "hourly": ["temperature_2m", "precipitation"],
     "timezone": "Europe/Berlin"
