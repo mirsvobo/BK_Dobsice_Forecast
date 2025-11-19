@@ -11,8 +11,7 @@ class DataLoader:
         print(f"INFO: Načítám data ze souboru '{self.file_path}'...")
 
         try:
-            # Načtení Excelu (nebo CSV, pandas to zvládne detekovat, pokud koncovka sedí)
-            if self.file_path.endswith('.csv'):
+            if self.file_path.lower().endswith('.csv'):
                 df = pd.read_csv(self.file_path)
             else:
                 df = pd.read_excel(self.file_path, sheet_name=self.sheet_name)
@@ -20,42 +19,55 @@ class DataLoader:
             print(f"CHYBA: Nelze načíst soubor: {e}")
             return pd.DataFrame(), pd.DataFrame(), None, None
 
-        # 1. Přejmenování sloupců dle Configu
-        # Používáme nové mapování pro data1.xlsx
+        # 1. Očištění a přejmenování
+        df.columns = [c.strip() for c in df.columns]
+
         rename_map = {
             config.DATE_COLUMN: 'date_raw',
             config.SALES_COLUMN: 'y_sales',
             config.GUESTS_COLUMN: 'y_guests',
             config.CHANNEL_COLUMN: 'unique_id'
         }
-        df = df.rename(columns=rename_map)
 
-        # GPS souřadnice - BEREME Z CONFIGU (Hardcoded atributy)
+        # Aplikace mapy jen na existující sloupce
+        final_map = {k: v for k, v in rename_map.items() if k in df.columns}
+        df = df.rename(columns=final_map)
+
+        # GPS z Configu
         lat = config.RESTAURANT_META['Latitude']
         lon = config.RESTAURANT_META['Longitude']
 
         # 2. Zpracování data
-        df['ds'] = pd.to_datetime(df['date_raw'])
+        df['ds'] = pd.to_datetime(df['date_raw'], errors='coerce')
         df = df.dropna(subset=['ds'])
 
-        # Konverze čísel (ošetření čárek/teček)
+        # Konverze čísel
         for col in ['y_sales', 'y_guests']:
-            if df[col].dtype == object:
-                df[col] = df[col].astype(str).str.replace(',', '.')
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            if col in df.columns:
+                if df[col].dtype == object:
+                    df[col] = df[col].astype(str).str.replace(',', '.')
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            else:
+                df[col] = 0.0
 
-        # 3. AGREGACE NA DNY (Sumarizace)
-        # Protože v souboru mohou být řádky pro stejný den a kanál (nebo hodiny),
-        # sečteme je na úroveň Dne.
+        # 3. AGREGACE NA DNY
         print("INFO: Agreguji data na denní úroveň...")
         df_agg = df.groupby(['ds', 'unique_id'])[['y_sales', 'y_guests']].sum().reset_index()
         df = df_agg
+
+        # --- FIX: DOPLNĚNÍ CHYBĚJÍCÍCH DNŮ (GAPS) ---
+        if not df.empty:
+            all_dates = pd.date_range(start=df['ds'].min(), end=df['ds'].max(), freq='D')
+            all_ids = df['unique_id'].unique()
+
+            idx = pd.MultiIndex.from_product([all_dates, all_ids], names=['ds', 'unique_id'])
+            df = df.set_index(['ds', 'unique_id']).reindex(idx, fill_value=0).reset_index()
 
         # 4. Filtr historických dat
         mask = (df['ds'] >= config.TRAIN_START_DATE)
         df = df.loc[mask]
 
-        # 5. Příprava formátu
+        # 5. Formát pro model
         sales_df = df[['ds', 'unique_id', 'y_sales']].rename(columns={'y_sales': 'y'})
         guests_df = df[['ds', 'unique_id', 'y_guests']].rename(columns={'y_guests': 'y'})
 
@@ -72,7 +84,7 @@ class DataLoader:
         sales_df = sales_df.sort_values(['unique_id', 'ds']).reset_index(drop=True)
         guests_df = guests_df.sort_values(['unique_id', 'ds']).reset_index(drop=True)
 
-        print(f"INFO: Data připravena. Počet řádků (Daily): {len(sales_df)}")
+        print(f"INFO: Data připravena. Počet řádků: {len(sales_df)}")
         return sales_df, guests_df, lat, lon
 
     @staticmethod

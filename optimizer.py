@@ -2,9 +2,7 @@ import optuna
 import pandas as pd
 import multiprocessing
 import logging
-
-# Import funkce z workeru
-from worker import train_process_worker
+import importlib
 
 # Potlačení logů
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
@@ -17,16 +15,18 @@ class ModelOptimizer:
         self.n_trials = n_trials
 
     def objective(self, trial):
+        # --- FIX PICKLING ERROR ---
+        # Importujeme worker až TADY a vynutíme reload.
+        # Tím zajistíme, že multiprocessing dostane správný odkaz na funkci.
+        import worker
+        importlib.reload(worker)
+
         # 1. Návrh parametrů
         params = {
             "learning_rate": trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
-            # Snížíme Hidden Size pro stabilitu, Optuna si to může zvednout, pokud to půjde
-            "hidden_size": trial.suggest_categorical("hidden_size", [64]),
+            "hidden_size": trial.suggest_categorical("hidden_size", [64, 128]),
             "dropout": trial.suggest_float("dropout", 0.1, 0.4),
-
-            # --- FIX: SNÍŽENÍ BATCH SIZE ---
-            # 64 je moc agresivní pro optimization loop. 32 je bezpečné.
-            "batch_size": 32
+            "batch_size": 32 # Pro optimalizaci stačí menší batch
         }
 
         # 2. Serializace dat (DataFrame -> Dict) pro přenos do procesu
@@ -35,11 +35,12 @@ class ModelOptimizer:
         # 3. Spuštění workeru
         queue = multiprocessing.Queue()
 
-        # Windows vyžaduje 'spawn' pro CUDA
+        # Windows vyžaduje 'spawn'
         ctx = multiprocessing.get_context('spawn')
 
+        # Použijeme worker.train_process_worker (z modulu, ne z importu nahoře)
         process = ctx.Process(
-            target=train_process_worker,
+            target=worker.train_process_worker,
             args=(params, train_data_dict, self.horizon, queue)
         )
 
@@ -52,7 +53,7 @@ class ModelOptimizer:
             if result['status'] == 'ok':
                 return result['mae']
             else:
-                # Pokud to spadne (OOM), vrátíme "nekonečno", aby Optuna zkusila jiné parametry
+                # Pokud to spadne (OOM), vrátíme "nekonečno"
                 return float('inf')
         else:
             return float('inf')

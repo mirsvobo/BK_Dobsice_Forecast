@@ -1,13 +1,12 @@
 import os
 
 # --- 1. Konfigurace cest a souborů ---
-DATA_FILE = 'data1.xlsx'  # Nový soubor
-SHEET_NAME = 0            # Načteme první list (obvykle index 0)
+DATA_FILE = 'data1.xlsx'
+SHEET_NAME = 0
 WEATHER_CACHE_DIR = ".cache_weather"
 MODEL_CHECKPOINT_DIR = "bk_model_checkpoints"
 
-# --- 2. ATRIBUTY RESTAURACE (Hardcoded) ---
-# Převedeno ze zadání přímo do kódu
+# --- 2. ATRIBUTY RESTAURACE ---
 RESTAURANT_META = {
     'City': 'Dobsice',
     'Latitude': 50.121113,
@@ -18,30 +17,29 @@ RESTAURANT_META = {
     'Delivery_Date': '2021-03-12'
 }
 
-# --- 3. Mapování sloupců (dle data1.xlsx) ---
-# Na základě vašeho CSV exportu:
-# "Calendar Date", "CK - Sales Net", "Sales Channel", "CK - Guests"
+# --- 3. Mapování sloupců ---
 DATE_COLUMN = 'Calendar Date'
 SALES_COLUMN = 'CK - Sales Net'
 GUESTS_COLUMN = 'CK - Guests'
 CHANNEL_COLUMN = 'Sales Channel'
 
 # --- 4. Konfigurace prognózy (DENNÍ) ---
-TRAIN_START_DATE = '2021-02-01' # Od otevření
-FORECAST_START = '2025-11-01'
-FORECAST_END = '2025-11-30'
-FREQ = 'D'  # <--- DENNÍ FREKVENCE
+TRAIN_START_DATE = '2021-02-01'
+FREQ = 'D'
 
-# --- 5. Parametry modelu (TFT - Daily) ---
+# --- 5. Parametry modelu (TFT) ---
 TFT_PARAMS = {
-    'h': 31,                # 31 dní dopředu
-    'input_size': 60,       # 2 měsíce kontextu
-    'max_steps': 500,
-    'early_stop_patience_steps': 20,
-    'learning_rate': 0.001,
-    'hidden_size': 64,
-    'batch_size': 64,       # Bezpečné pro paměť
+    'h': 60,
+    'input_size': 120,
+    'max_epochs': 500,
+    'max_steps': 15000,
+    'early_stop_patience_steps': 10,
+    'learning_rate': 0.0005,
+    'hidden_size': 128,
+    'batch_size': 128,
     'scaler_type': 'robust',
+    'dropout': 0.1,
+    'attn_head_size': 4,
 }
 
 TRAINER_KWARGS = {
@@ -49,7 +47,7 @@ TRAINER_KWARGS = {
     'devices': 1,
 }
 
-# --- 6. Features (Denní) ---
+# --- 6. Features (Příznaky) ---
 FUTR_EXOG_LIST = [
     'sin_day', 'cos_day',
     'is_holiday', 'is_weekend',
@@ -57,16 +55,34 @@ FUTR_EXOG_LIST = [
     'is_school_holiday',
     'is_event_rfp', 'is_event_vp', 'is_event_ba',
     'is_event_ap', 'is_competitor_closed',
-    'is_covid_restriction'
+    'is_covid_restriction',
+
+    # --- NOVÉ VÁNOČNÍ FEATURES ---
+    'is_closed',       # Pro 24. a 25. 12.
+    'is_short_open'    # Pro 26. a 31. 12.
 ]
 
-# --- 7. Business Logika ---
-# Eventy
+# --- 7. Business Logika & Eventy ---
+
+# Generátor vánočních dat pro roky 2021-2026
+# Aby se model naučil z historie, že se to opakuje každý rok
+CHRISTMAS_CLOSED = []
+CHRISTMAS_SHORT = []
+
+for year in range(2021, 2027):
+    # 24. a 25. Zavřeno
+    CHRISTMAS_CLOSED.append((f'{year}-12-24', f'{year}-12-25'))
+    # 26. Omezeno
+    CHRISTMAS_SHORT.append((f'{year}-12-26', f'{year}-12-26'))
+    # 31. Silvestr Omezeno
+    CHRISTMAS_SHORT.append((f'{year}-12-31', f'{year}-12-31'))
+
 EVENT_KFC_CLOSED = ('2024-10-01', '2024-10-31')
 EVENT_ROCK_FOR_PEOPLE = [('2023-06-07', '2023-06-12'), ('2024-06-11', '2024-06-16'), ('2025-06-10', '2025-06-15')]
 EVENT_VELKA_PARDUBICKA = [('2023-10-07', '2023-10-08'), ('2024-10-12', '2024-10-13'), ('2025-10-11', '2025-10-12')]
 EVENT_BRUTAL_ASSAULT = [('2023-08-09', '2023-08-13'), ('2024-08-07', '2024-08-11'), ('2025-08-06', '2025-08-10')]
 EVENT_AVIATICKA_POUT = [('2023-05-27', '2023-05-28'), ('2024-06-01', '2024-06-02'), ('2025-05-31', '2025-06-01')]
+
 SCHOOL_HOLIDAYS = [
     ('2023-02-06', '2023-03-19'), ('2023-04-06', '2023-04-10'),
     ('2023-07-01', '2023-09-03'), ('2023-10-26', '2023-10-29'),

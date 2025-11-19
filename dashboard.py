@@ -1,13 +1,13 @@
 import os
 import sys
 import streamlit as st
+import io
+import numpy as np # Přidán numpy pro ošetření dělení
 
-# --- 1. ENVIRONMENT & CONFIG (Musí být nahoře) ---
+# --- 1. ENVIRONMENT & CONFIG ---
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
-# --- 2. FUNKCE PRO NAČTENÍ KNIHOVEN (Lazy Loading) ---
-# Tím zabráníme tomu, aby se PyTorch/Lightning načítal v procesech, kde to není potřeba,
-# a hlavně to vyřeší kruhové závislosti při 'spawn' na Windows.
+# --- 2. MODULES ---
 def get_engine_modules():
     from dataloader import DataLoader
     from feature_engineer import FeatureEngineer
@@ -17,98 +17,152 @@ def get_engine_modules():
     import config
     return DataLoader, FeatureEngineer, WeatherService, ForecastModel, ModelOptimizer, config
 
+# --- CACHED DATA LOADERS ---
+@st.cache_data
+def load_data_cached():
+    from dataloader import DataLoader
+    loader = DataLoader()
+    return loader.load_data()
+
+@st.cache_data
+def get_weather_cached(lat, lon, start, end):
+    from weather_service import WeatherService
+    ws = WeatherService()
+    return ws.get_weather_data(lat, lon, str(start), str(end))
+
+@st.cache_data
+def get_hourly_distribution_profile():
+    import config
+    try:
+        if config.DATA_FILE.lower().endswith('.csv'):
+            df = pd.read_csv(config.DATA_FILE)
+        else:
+            df = pd.read_excel(config.DATA_FILE, sheet_name=config.SHEET_NAME)
+    except Exception as e:
+        st.error(f"Chyba profilu: {e}")
+        return pd.DataFrame()
+
+    df.columns = [c.strip() for c in df.columns]
+    rename_map = {
+        config.DATE_COLUMN: 'date',
+        config.SALES_COLUMN: 'y',
+        config.CHANNEL_COLUMN: 'unique_id'
+    }
+    time_col = next((c for c in df.columns if 'Time' in c or 'Closing' in c), None)
+    if time_col: rename_map[time_col] = 'time'
+    df = df.rename(columns=rename_map)
+
+    if 'time' not in df.columns:
+        df['hour'] = 12
+    else:
+        df['hour'] = pd.to_datetime(df['time'].astype(str), errors='coerce').dt.hour.fillna(12).astype(int)
+
+    df['ds'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df.dropna(subset=['ds'])
+    df['dayofweek'] = df['ds'].dt.dayofweek
+    if df['y'].dtype == object:
+        df['y'] = df['y'].astype(str).str.replace(',', '.')
+    df['y'] = pd.to_numeric(df['y'], errors='coerce').fillna(0)
+
+    profile = df.groupby(['unique_id', 'dayofweek', 'hour'])['y'].mean().reset_index()
+    daily_sum = profile.groupby(['unique_id', 'dayofweek'])['y'].transform('sum')
+    profile['share'] = profile['y'] / daily_sum
+    profile = profile.fillna(0)
+    return profile[['unique_id', 'dayofweek', 'hour', 'share']]
+
 import pandas as pd
 import plotly.graph_objects as go
 
+# --- POMOCNÁ FUNKCE: DISTRIBUCE TOTALU DO KANÁLŮ ---
+def reconcile_components(df_long):
+    """
+    Vezme Total a poměrově ho rozdělí mezi ostatní kanály.
+    Zajistí: Sum(Channels) == Total
+    """
+    # Pivot na Wide (řádky=Datum, sloupce=Kanály)
+    df_wide = df_long.pivot_table(
+        index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum'
+    ).reset_index()
+
+    if 'Total' not in df_wide.columns:
+        return df_long # Pokud chybí Total, vracíme původní
+
+    # Seznam kanálů (vše kromě ds a Total)
+    channels = [c for c in df_wide.columns if c not in ['ds', 'Total']]
+
+    if not channels:
+        return df_long
+
+    # 1. Součet komponent (jak to vidí model jednotlivě)
+    current_sum = df_wide[channels].sum(axis=1)
+    target_total = df_wide['Total']
+
+    # 2. Výpočet poměru (Target / Current)
+    # Ošetření dělení nulou
+    ratio = target_total / current_sum
+    ratio = ratio.fillna(1.0) # Kde je suma 0, necháme to být (0 * 1 = 0)
+    # Pokud je suma 0 ale total > 0, nelze rozdělit -> ratio bude inf.
+    # V tom případě nahradíme 0 (kanály zůstanou 0) nebo 1.
+    ratio = ratio.replace([np.inf, -np.inf], 0.0)
+
+    # 3. Přepočet kanálů
+    mask = current_sum != 0
+    for c in channels:
+        # Původní hodnota * Ratio
+        df_wide.loc[mask, c] = df_wide.loc[mask, c] * ratio[mask]
+
+    # 4. Melt zpátky na Long format (pro grafy a další zpracování)
+    df_final = df_wide.melt(id_vars=['ds'], value_name='Forecast_Value', var_name='unique_id')
+    return df_final
+
 # --- 3. HLAVNÍ APLIKACE ---
 def main():
-    # Page Config musí být první Streamlit příkaz
-    st.set_page_config(
-        page_title="BK Dobšice Forecast AI",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
+    st.set_page_config(page_title="BK Forecast AI", layout="wide")
+    st.markdown("""<style>h1 { color: #D62300; }.stButton>button { background-color: #D62300; color: white; font-weight: bold; border-radius: 8px; }</style>""", unsafe_allow_html=True)
 
-    # Styling
-    st.markdown("""
-        <style>
-        h1 { color: #D62300; }
-        .stButton>button { background-color: #D62300; color: white; font-weight: bold; border-radius: 8px; }
-        .stProgress .st-bo { background-color: #D62300; }
-        </style>
-        """, unsafe_allow_html=True)
-
-    # Načtení modulů až zde
     DataLoader, FeatureEngineer, WeatherService, ForecastModel, ModelOptimizer, config = get_engine_modules()
 
-    st.title("BK Dobšice: AI Forecast 2.0")
-    st.caption(f"Engine: NeuralForecast (TFT) | Hardware: NVIDIA RTX 5070 | Režim: Windows Process Isolation")
+    st.title("BK Dobšice: AI Forecast (Daily -> Hourly)")
+    st.caption(f"Engine: NeuralForecast (TFT) | Režim: Denní model (Auto-Reconcile)")
 
     # --- SIDEBAR ---
     st.sidebar.header("⚙️ Nastavení")
-    forecast_start_date = st.sidebar.date_input("Start Predikce", value=pd.to_datetime(config.FORECAST_START).date())
-    forecast_days = st.sidebar.slider("Horizont (dny)", 1, 31, 30)
-    use_optimization = st.sidebar.checkbox("Zapnout Optunu (Auto-Tuning)", value=False, help="Bude trvat déle.")
+    with st.spinner("Analyzuji data..."):
+        sales_df, _, _, _ = load_data_cached()
+        last_hist_date = sales_df['ds'].max()
+        next_day = last_hist_date + pd.Timedelta(days=1)
+
+    forecast_start_date = st.sidebar.date_input(
+        "Start Predikce",
+        value=next_day.date(),
+        help="Automaticky nastaveno na den po konci dat."
+    )
+
+    st.sidebar.caption(f"Horizont: {config.TFT_PARAMS['h']} dní")
+    use_optimization = st.sidebar.checkbox("Zapnout Optunu", value=False)
     force_retrain = st.sidebar.checkbox("Vynutit přetrénování", value=False)
 
-    # --- CACHED FUNCTIONS ---
-    @st.cache_data
-    def load_data_cached():
-        loader = DataLoader()
-        return loader.load_data()
-
-    @st.cache_data
-    def get_weather_cached(lat, lon, start, end):
-        ws = WeatherService()
-        return ws.get_weather_data(lat, lon, str(start), str(end))
-
-    # --- PLOT FUNCTION ---
-    def plot_interactive(df_hist, df_pred, unique_id):
-        last_date = df_hist['ds'].max()
-        start_view = last_date - pd.Timedelta(days=30)
-
-        hist = df_hist[(df_hist['unique_id'] == unique_id) & (df_hist['ds'] >= start_view)]
-        pred = df_pred[df_pred['unique_id'] == unique_id]
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=hist['ds'], y=hist['y'], mode='lines', name='Historie', line=dict(color='black', width=1)))
-        fig.add_trace(go.Scatter(x=pred['ds'], y=pred['Forecast_Value'], mode='lines', name='AI Predikce', line=dict(color='#D62300', width=3)))
-
-        if 'y_pred_low' in pred.columns and 'y_pred_high' in pred.columns:
-            fig.add_trace(go.Scatter(x=pred['ds'], y=pred['y_pred_high'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-            fig.add_trace(go.Scatter(x=pred['ds'], y=pred['y_pred_low'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(214, 35, 0, 0.2)', name='Interval 80%', hoverinfo='skip'))
-
-        fig.update_layout(title=f"Prognóza: {unique_id}", height=500, template="plotly_white", xaxis_title="Datum", yaxis_title="Hodnota")
-        return fig
-
-    # --- LOGIC ---
-    with st.spinner("Načítám data..."):
-        sales_df, guests_df, lat, lon = load_data_cached()
-
-    if sales_df.empty:
-        st.error("Nepodařilo se načíst data.")
-        st.stop()
-
+    # KPI
     S, tags = DataLoader.get_hierarchy_matrix(sales_df)
     unique_ids = list(sales_df['unique_id'].unique())
 
-    # KPI
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Záznamy", f"{len(sales_df):,}")
-    c2.metric("Start Dat", sales_df['ds'].min().strftime('%d.%m.%Y'))
-    c3.metric("Konec Dat", sales_df['ds'].max().strftime('%d.%m.%Y'))
-    c4.metric("Kanály", len(unique_ids))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Historie do", last_hist_date.strftime('%d.%m.%Y'))
+    c2.metric("Kanály", len(unique_ids))
+    c3.metric("Horizont", f"{config.TFT_PARAMS['h']} dní")
 
     st.divider()
-    st.subheader("1. Příprava Dat")
 
+    # 1. FEATURES
     if 'fe_done' not in st.session_state:
         st.info("Klikni pro přípravu dat.")
 
     if st.button("🔄 Spustit Data Pipeline"):
-        with st.spinner("Stahuji počasí a generuji features..."):
+        with st.spinner("Stahuji počasí..."):
+            sales_df, guests_df, lat, lon = load_data_cached()
+
             train_end_dt = pd.to_datetime(forecast_start_date)
-            forecast_end_dt = train_end_dt + pd.Timedelta(days=forecast_days)
+            forecast_end_dt = train_end_dt + pd.Timedelta(days=config.TFT_PARAMS['h'] + 10)
             weather_df = get_weather_cached(lat, lon, config.TRAIN_START_DATE, str(forecast_end_dt))
 
             fe = FeatureEngineer()
@@ -120,16 +174,18 @@ def main():
             st.session_state['weather_df'] = weather_df
             st.session_state['fe'] = fe
             st.session_state['fe_done'] = True
-            st.success("Data připravena!")
+            st.success("Data připravena.")
 
+    # 2. MODEL
     if st.session_state.get('fe_done'):
         st.divider()
-        st.subheader("2. AI Model (TFT)")
-
-        if st.button("🚀 Spustit Predikci", type="primary"):
-            status_container = st.status("Startuji výpočet na RTX 5070...", expanded=True)
+        if st.button("🚀 Spustit Predikci (TFT)", type="primary"):
+            status = st.status("Pracuji...", expanded=True)
             try:
                 train_cutoff = pd.to_datetime(forecast_start_date)
+                if train_cutoff > next_day:
+                    train_cutoff = next_day
+
                 train_sales = st.session_state['sales_aug'][st.session_state['sales_aug']['ds'] < train_cutoff]
                 train_guests = st.session_state['guests_aug'][st.session_state['guests_aug']['ds'] < train_cutoff]
 
@@ -137,78 +193,132 @@ def main():
                 model_loaded = False
 
                 if not force_retrain:
-                    status_container.write("Hledám uložený model...")
+                    status.write("Hledám model...")
                     model_loaded = model.load_model(config.MODEL_CHECKPOINT_DIR)
 
                 if not model_loaded:
-                    status_container.write("Trénuji nový model (může trvat několik minut)...")
+                    status.write("Trénuji model...")
                     best_params = None
                     if use_optimization:
-                        status_container.write("Běží Optuna optimalizace...")
-                        optimizer = ModelOptimizer(train_sales, horizon=24*7, n_trials=10)
+                        optimizer = ModelOptimizer(train_sales, horizon=config.TFT_PARAMS['h'], n_trials=10)
                         best_params = optimizer.optimize()
 
                     model = ForecastModel(best_params=best_params)
                     model.train(train_sales, train_guests)
                     model.save_model(config.MODEL_CHECKPOINT_DIR)
-                    status_container.write("Model uložen.")
+                    status.write("Uloženo.")
 
-                status_container.write("Generuji předpověď...")
-                dates = pd.date_range(start=forecast_start_date, periods=forecast_days*24, freq='h')
-                future_df = pd.concat([pd.DataFrame({'ds': dates, 'unique_id': uid}) for uid in unique_ids])
+                status.write("Generuji předpověď...")
+                horizon = config.TFT_PARAMS['h']
+                dates = pd.date_range(start=train_cutoff, periods=horizon, freq='D')
+
+                future_df = pd.DataFrame()
+                for uid in unique_ids:
+                    tmp = pd.DataFrame({'ds': dates, 'unique_id': uid})
+                    future_df = pd.concat([future_df, tmp])
 
                 fe = st.session_state['fe']
                 future_aug = fe.transform(future_df, st.session_state['weather_df'])
-                p_sales, p_guests = model.predict(future_aug, S, tags)
 
+                p_sales, p_guests = model.predict(future_aug, S, tags)
                 st.session_state['preds_sales'] = p_sales
                 st.session_state['preds_guests'] = p_guests
-                status_container.update(label="Hotovo! ✅", state="complete", expanded=False)
+                status.update(label="Hotovo! ✅", state="complete", expanded=False)
 
             except Exception as e:
-                status_container.update(label="Chyba!", state="error")
-                st.error(f"Error: {e}")
+                status.update(label="Chyba!", state="error")
+                st.error(f"Chyba: {e}")
                 st.exception(e)
 
+    # 3. VÝSLEDKY & EXPORT
     if 'preds_sales' in st.session_state:
         st.divider()
         st.subheader("3. Výsledky")
-        sel_id = st.selectbox("Kanál:", unique_ids)
-        st.plotly_chart(plot_interactive(sales_df, st.session_state['preds_sales'], sel_id), use_container_width=True)
 
-        if 'preds_sales' in st.session_state:
-            st.divider()
-        st.subheader("3. Výsledky")
-        sel_id = st.selectbox("Kanál:", unique_ids)
-        st.plotly_chart(plot_interactive(sales_df, st.session_state['preds_sales'], sel_id), use_container_width=True)
+        # --- APLIKACE REKONCILIACE (Total -> Channels) ---
+        # Upravíme data v paměti pro zobrazení i export
+        sales_viz = reconcile_components(st.session_state['preds_sales'])
+        guests_viz = reconcile_components(st.session_state['preds_guests'])
 
-        # --- 4. EXPORT (TOTO TAM CHYBĚLO) ---
+        sel_id = st.selectbox("Vyber kanál:", unique_ids)
+        hist_sales, _, _, _ = load_data_cached()
+
+        def plot_interactive(df_hist, df_pred, unique_id):
+            last_date = df_hist['ds'].max()
+            start_view = last_date - pd.Timedelta(days=60)
+            hist = df_hist[(df_hist['unique_id'] == unique_id) & (df_hist['ds'] >= start_view)]
+            pred = df_pred[df_pred['unique_id'] == unique_id]
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=hist['ds'], y=hist['y'], mode='lines', name='Historie', line=dict(color='black', width=1)))
+            fig.add_trace(go.Scatter(x=pred['ds'], y=pred['Forecast_Value'], mode='lines+markers', name='AI Predikce', line=dict(color='#D62300', width=3)))
+            fig.update_layout(title=f"Prognóza: {unique_id}", height=500, template="plotly_white")
+            return fig
+
+        st.plotly_chart(plot_interactive(hist_sales, sales_viz, sel_id), use_container_width=True)
+
         st.subheader("4. Export Dat")
-        c1, c2 = st.columns(2)
+        col_d1, col_d2 = st.columns(2)
 
-        # A) Export do Excelu (Vše v jednom)
-        import io
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            st.session_state['preds_sales'].to_excel(writer, sheet_name='Sales', index=False)
-            st.session_state['preds_guests'].to_excel(writer, sheet_name='Guests', index=False)
+        # --- A) DENNÍ EXPORT (Wide) ---
+        with col_d1:
+            st.markdown("**Denní (Wide)**")
 
-        c1.download_button(
-            label="📥 Stáhnout Excel (.xlsx)",
-            data=buffer.getvalue(),
-            file_name="BK_Forecast_Final.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            sales_pivot = sales_viz.pivot_table(
+                index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum'
+            ).reset_index()
 
-        # B) Export do CSV (Záloha)
-        csv_sales = st.session_state['preds_sales'].to_csv(index=False).encode('utf-8')
-        c2.download_button(
-            label="📥 Stáhnout CSV (jen Sales)",
-            data=csv_sales,
-            file_name="forecast_sales.csv",
-            mime="text/csv"
-        )
+            guests_pivot = guests_viz.pivot_table(
+                index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum'
+            ).reset_index()
 
-# --- 4. ENTRY POINT (TOHLE JE KLÍČ K OPRAVĚ) ---
+            sales_pivot['ds'] = sales_pivot['ds'].dt.date
+            guests_pivot['ds'] = guests_pivot['ds'].dt.date
+
+            buffer_daily = io.BytesIO()
+            with pd.ExcelWriter(buffer_daily, engine='openpyxl') as writer:
+                sales_pivot.to_excel(writer, sheet_name='Sales_Daily', index=False)
+                guests_pivot.to_excel(writer, sheet_name='Guests_Daily', index=False)
+            st.download_button("📥 Stáhnout Denní Excel", buffer_daily.getvalue(), "Forecast_Daily.xlsx")
+
+        # --- B) HODINOVÝ EXPORT (Wide) ---
+        with col_d2:
+            st.markdown("**Hodinový (Wide)**")
+            if st.button("🔢 Přepočítat na hodiny"):
+                with st.spinner("Počítám..."):
+                    hourly_profile = get_hourly_distribution_profile()
+                    if hourly_profile.empty:
+                        st.error("Chybí profil.")
+                    else:
+                        # Použijeme už opravená (reconciled) data
+                        daily_preds = sales_viz.copy()
+                        daily_preds['dayofweek'] = daily_preds['ds'].dt.dayofweek
+
+                        merged = pd.merge(daily_preds, hourly_profile, on=['unique_id', 'dayofweek'], how='left')
+                        merged['hour'] = merged['hour'].fillna(12).astype(int)
+                        merged['share'] = merged['share'].fillna(0)
+                        merged['Forecast_CZK'] = merged['Forecast_Value'] * merged['share']
+                        merged['Final_Date_Time'] = merged.apply(lambda x: x['ds'] + pd.Timedelta(hours=x['hour']), axis=1)
+
+                        # Pivot na Wide
+                        export_pivot = merged.pivot_table(
+                            index='Final_Date_Time', columns='unique_id', values='Forecast_CZK', aggfunc='sum'
+                        ).reset_index()
+                        export_pivot = export_pivot.sort_values('Final_Date_Time')
+
+                        # Total v hodinovém exportu vznikne automaticky součtem (protože zdrojová data sedí)
+                        # Ale pro jistotu ho můžeme přepočítat
+                        channels_h = [c for c in export_pivot.columns if c not in ['Final_Date_Time', 'Total']]
+                        if channels_h:
+                            export_pivot['Total'] = export_pivot[channels_h].sum(axis=1)
+
+                        buffer_hourly = io.BytesIO()
+                        with pd.ExcelWriter(buffer_hourly, engine='openpyxl') as writer:
+                            export_pivot.to_excel(writer, sheet_name='Hourly_Sales', index=False)
+                        st.session_state['hourly_buffer'] = buffer_hourly
+                        st.success("Hotovo!")
+
+            if 'hourly_buffer' in st.session_state:
+                st.download_button("📥 Stáhnout Hodinový Excel", st.session_state['hourly_buffer'].getvalue(), "Forecast_Hourly.xlsx")
+
 if __name__ == "__main__":
     main()

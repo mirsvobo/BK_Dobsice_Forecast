@@ -3,14 +3,13 @@ import torch
 import logging
 import warnings
 import os
-import sys
 
 # Nutné importy pro proces
 from neuralforecast import NeuralForecast
 from neuralforecast.models import TFT
 from neuralforecast.losses.pytorch import HuberMQLoss
 
-# Potlačení bordelu v logu
+# Potlačení logů v procesu
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 warnings.filterwarnings('ignore')
 
@@ -19,30 +18,27 @@ def train_process_worker(params, train_data_dict, horizon, queue):
     Izolovaný proces pro trénink jednoho modelu v Optuně.
     """
     try:
-        # 1. Rekonstrukce DataFrame z dict (rychlejší než pickle celého DF)
+        # 1. Rekonstrukce DataFrame
         train_df = pd.DataFrame(train_data_dict)
-
-        # Ujistíme se, že 'ds' je datetime
         if 'ds' in train_df.columns:
             train_df['ds'] = pd.to_datetime(train_df['ds'])
 
-        # 2. Definice Modelu s OCHRANOU PAMĚTI
-        # Zde musíme mít stejné optimalizace jako v hlavním modelu!
+        # 2. Definice Modelu (Musí být lehký a rychlý)
         model = TFT(
             h=horizon,
-            input_size=168, # Fixní podle configu
+            input_size=60, # Fixní pro optunu (nebo params['input_size'] pokud bychom ladili i to)
             hidden_size=params['hidden_size'],
             learning_rate=params['learning_rate'],
             dropout=params['dropout'],
             batch_size=params['batch_size'],
-            max_steps=500,  # Pro optimalizaci stačí méně kroků
+            max_steps=300,  # Pro Optunu stačí málo kroků
             loss=HuberMQLoss(quantiles=[0.1, 0.5, 0.9]),
             scaler_type='robust',
             alias='TFT_Optuna',
 
-            # --- GPU OPTIMALIZACE (KRITICKÉ) ---
+            # --- GPU OPTIMALIZACE ---
             accelerator="gpu",
-            precision="16-mixed",  # <--- TOTO CHYBĚLO! (Šetří 50% VRAM)
+            precision="16-mixed", # Šetří paměť
 
             # --- WINDOWS FIX ---
             num_workers_loader=0,
@@ -51,31 +47,24 @@ def train_process_worker(params, train_data_dict, horizon, queue):
             enable_progress_bar=False
         )
 
-        # Manuální fix pro jistotu
+        # Pojistka pro Windows
         model.num_workers_loader = 0
 
         # 3. Trénink
-        nf = NeuralForecast(models=[model], freq='h')
+        nf = NeuralForecast(models=[model], freq='D') # Důležité: 'D' pro denní
 
-        # Zkusíme trénink. Pokud dojde paměť, zachytíme to.
         try:
+            # Fit
             nf.fit(df=train_df)
 
-            # Validace (posledních 24h z tréninkových dat jako proxy)
-            # V reálu bys měl mít split, ale pro rychlost použijeme in-sample chybu posledního okna
-            # Nebo lépe: cross_validation, ale to je pomalé.
-            # Pro jednoduchost zde jen vrátíme náhodnou metriku nebo placeholder,
-            # ideálně bys měl udělat nf.cross_validation().
-
-            # Rychlý odhad chyby (Cross Validation na posledním okně)
+            # Rychlý odhad chyby (validace na posledním okně)
             cv_df = nf.cross_validation(df=train_df, n_windows=1, step_size=horizon)
             mae = (cv_df['y'] - cv_df['TFT_Optuna']).abs().mean()
 
             queue.put({'status': 'ok', 'mae': mae})
 
         except RuntimeError as e:
-            if "out of memory" in str(e):
-                # Uvolnění paměti
+            if "out of memory" in str(e).lower():
                 torch.cuda.empty_cache()
                 queue.put({'status': 'error', 'message': 'OOM'})
             else:
@@ -84,5 +73,4 @@ def train_process_worker(params, train_data_dict, horizon, queue):
     except Exception as e:
         queue.put({'status': 'error', 'message': str(e)})
     finally:
-        # Úklid GPU
         torch.cuda.empty_cache()
