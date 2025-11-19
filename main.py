@@ -1,6 +1,5 @@
 import pandas as pd
 import sys
-import os
 import config
 from dataloader import DataLoader
 from feature_engineer import FeatureEngineer

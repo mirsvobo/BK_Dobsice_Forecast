@@ -3,128 +3,81 @@ import numpy as np
 import config
 
 class DataLoader:
-    """
-    Načítá data, čistí chyby (např. #N/V z Excelu), parsuje čas
-    a vytváří kompletní časovou osu (včetně nulových hodin).
-    """
     def __init__(self):
-        pass
+        self.file_path = config.DATA_FILE
+        self.sheet_name = config.SHEET_NAME
 
     def load_data(self):
-        print(f"INFO: Načítám data ze souboru '{config.DATA_FILE}'...")
+        print(f"INFO: Načítám data ze souboru '{self.file_path}'...")
+
         try:
-            df = pd.read_excel(config.DATA_FILE, sheet_name=config.SHEET_NAME)
+            # Načtení Excelu (nebo CSV, pandas to zvládne detekovat, pokud koncovka sedí)
+            if self.file_path.endswith('.csv'):
+                df = pd.read_csv(self.file_path)
+            else:
+                df = pd.read_excel(self.file_path, sheet_name=self.sheet_name)
         except Exception as e:
-            print(f"CHYBA: Nelze načíst Excel: {e}")
+            print(f"CHYBA: Nelze načíst soubor: {e}")
             return pd.DataFrame(), pd.DataFrame(), None, None
 
-        # --- 1. Čištění a Zpracování Času (ROBUSTNÍ FIX) ---
-        print("INFO: Zpracovávám časové údaje a čistím chyby...")
-
-        # Převedeme sloupec s časem na string
-        time_col = df[config.TIME_COLUMN].astype(str).str.strip()
-
-        # Vezmeme jen část před dvojtečkou (řeší "11:00" -> "11", ale i "11" -> "11")
-        hour_part = time_col.str.split(':').str[0]
-
-        # DŮLEŽITÉ: Bezpečný převod na číslo.
-        # 'errors=coerce' změní '#N/V', 'null', 'text' na NaN (Not a Number)
-        df['hour_int'] = pd.to_numeric(hour_part, errors='coerce')
-
-        # Zjistíme, kolik řádků je vadných
-        n_missing = df['hour_int'].isna().sum()
-        if n_missing > 0:
-            print(f"VAROVÁNÍ: Nalezeno {n_missing} řádků s neplatným časem (např. #N/V). Tyto řádky ignoruji.")
-            # Odstraníme řádky, kde se nepovedlo určit hodinu
-            df = df.dropna(subset=['hour_int'])
-
-        # Teď už bezpečně převedeme na integer
-        df['hour_int'] = df['hour_int'].astype(int)
-
-        # Zpracování Data
-        df[config.DATE_COLUMN] = pd.to_datetime(df[config.DATE_COLUMN])
-
-        # Vytvoření indexu 'ds' (Datum + Hodina)
-        df['ds'] = df[config.DATE_COLUMN] + pd.to_timedelta(df['hour_int'], unit='h')
-
-        # Přejmenování
-        df = df.rename(columns={
+        # 1. Přejmenování sloupců dle Configu
+        # Používáme nové mapování pro data1.xlsx
+        rename_map = {
+            config.DATE_COLUMN: 'date_raw',
             config.SALES_COLUMN: 'y_sales',
             config.GUESTS_COLUMN: 'y_guests',
-            config.CHANNEL_COLUMN: 'unique_id',
-            config.LAT_COLUMN: 'lat',
-            config.LON_COLUMN: 'lon'
-        })
+            config.CHANNEL_COLUMN: 'unique_id'
+        }
+        df = df.rename(columns=rename_map)
 
-        # Filtr historie
-        df = df[df['ds'] >= config.TRAIN_START_DATE]
+        # GPS souřadnice - BEREME Z CONFIGU (Hardcoded atributy)
+        lat = config.RESTAURANT_META['Latitude']
+        lon = config.RESTAURANT_META['Longitude']
 
-        # Získání souřadnic (pokud existují)
-        lat_val = df['lat'].iloc[0] if 'lat' in df.columns and not df['lat'].isna().all() else None
-        lon_val = df['lon'].iloc[0] if 'lon' in df.columns and not df['lon'].isna().all() else None
+        # 2. Zpracování data
+        df['ds'] = pd.to_datetime(df['date_raw'])
+        df = df.dropna(subset=['ds'])
 
-        # --- 2. Agregace duplicit ---
-        # Sčítáme tržby, pokud je více řádků pro stejnou hodinu a kanál
-        df_agg = df.groupby(['ds', 'unique_id']).agg({
-            'y_sales': 'sum', 'y_guests': 'sum'
-        }).reset_index()
+        # Konverze čísel (ošetření čárek/teček)
+        for col in ['y_sales', 'y_guests']:
+            if df[col].dtype == object:
+                df[col] = df[col].astype(str).str.replace(',', '.')
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-        # --- 3. Vytvoření Totalu ---
-        df_total = df_agg.groupby('ds').agg({
-            'y_sales': 'sum', 'y_guests': 'sum'
-        }).reset_index()
-        df_total['unique_id'] = 'Total'
+        # 3. AGREGACE NA DNY (Sumarizace)
+        # Protože v souboru mohou být řádky pro stejný den a kanál (nebo hodiny),
+        # sečteme je na úroveň Dne.
+        print("INFO: Agreguji data na denní úroveň...")
+        df_agg = df.groupby(['ds', 'unique_id'])[['y_sales', 'y_guests']].sum().reset_index()
+        df = df_agg
 
-        combined_df = pd.concat([df_agg, df_total], ignore_index=True)
+        # 4. Filtr historických dat
+        mask = (df['ds'] >= config.TRAIN_START_DATE)
+        df = df.loc[mask]
 
-        # --- 4. FILL ZEROS (Doplnění chybějících hodin) ---
-        # Kritické pro časové řady: Pokud v datech chybí hodina (zavřeno), musí tam být nula.
-        print("INFO: Doplňuji nulové prodeje pro hodiny, kdy bylo zavřeno...")
+        # 5. Příprava formátu
+        sales_df = df[['ds', 'unique_id', 'y_sales']].rename(columns={'y_sales': 'y'})
+        guests_df = df[['ds', 'unique_id', 'y_guests']].rename(columns={'y_guests': 'y'})
 
-        unique_ids = combined_df['unique_id'].unique()
+        # 6. Total kanál
+        sales_total = sales_df.groupby('ds')['y'].sum().reset_index()
+        sales_total['unique_id'] = 'Total'
+        sales_df = pd.concat([sales_df, sales_total])
 
-        # Rozsah od začátku do konce dat
-        if combined_df.empty:
-            print("CHYBA: Po vyčištění nezbyla žádná data!")
-            return pd.DataFrame(), pd.DataFrame(), None, None
+        guests_total = guests_df.groupby('ds')['y'].sum().reset_index()
+        guests_total['unique_id'] = 'Total'
+        guests_df = pd.concat([guests_df, guests_total])
 
-        full_idx = pd.date_range(start=combined_df['ds'].min(), end=combined_df['ds'].max(), freq='h')
+        # Seřazení
+        sales_df = sales_df.sort_values(['unique_id', 'ds']).reset_index(drop=True)
+        guests_df = guests_df.sort_values(['unique_id', 'ds']).reset_index(drop=True)
 
-        final_dfs = []
-        for uid in unique_ids:
-            # Vezmeme data jednoho kanálu
-            temp = combined_df[combined_df['unique_id'] == uid].set_index('ds')
-
-            # Reindexujeme na plný rozsah hodin -> vzniknou NaN tam, kde bylo zavřeno
-            temp_reindexed = temp.reindex(full_idx).fillna({
-                'y_sales': 0,
-                'y_guests': 0,
-                'unique_id': uid # Vrátíme ID zpět
-            }).reset_index().rename(columns={'index': 'ds'})
-
-            final_dfs.append(temp_reindexed)
-
-        final_df = pd.concat(final_dfs, ignore_index=True)
-
-        # Rozdělení výstupů
-        df_sales = final_df[['ds', 'unique_id', 'y_sales']].rename(columns={'y_sales': 'y'})
-        df_guests = final_df[['ds', 'unique_id', 'y_guests']].rename(columns={'y_guests': 'y'})
-
-        print(f"INFO: Data připravena. Počet řádků: {len(final_df)}")
-        return df_sales, df_guests, lat_val, lon_val
+        print(f"INFO: Data připravena. Počet řádků (Daily): {len(sales_df)}")
+        return sales_df, guests_df, lat, lon
 
     @staticmethod
     def get_hierarchy_matrix(df):
-        # Matice pro rekonciliaci (BottomUp)
-        unique_ids = df[df['unique_id'] != 'Total']['unique_id'].unique()
-        unique_ids.sort()
-        S = pd.DataFrame(0, index=['Total'] + list(unique_ids), columns=list(unique_ids))
-        S.loc['Total'] = 1
-        for uid in unique_ids:
-            S.loc[uid, uid] = 1
-
-        tags = {
-            'Total': ['Total'],
-            'Total/Channel': list(unique_ids)
-        }
+        unique_ids = df['unique_id'].unique()
+        S = pd.DataFrame(np.eye(len(unique_ids)), index=unique_ids, columns=unique_ids)
+        tags = {'Country': unique_ids, 'Country/State': unique_ids}
         return S, tags
