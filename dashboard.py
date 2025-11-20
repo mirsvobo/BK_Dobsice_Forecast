@@ -2,7 +2,9 @@ import os
 import sys
 import streamlit as st
 import io
-import numpy as np # Přidán numpy pro ošetření dělení
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 
 # --- 1. ENVIRONMENT & CONFIG ---
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
@@ -30,50 +32,7 @@ def get_weather_cached(lat, lon, start, end):
     ws = WeatherService()
     return ws.get_weather_data(lat, lon, str(start), str(end))
 
-@st.cache_data
-def get_hourly_distribution_profile():
-    import config
-    try:
-        if config.DATA_FILE.lower().endswith('.csv'):
-            df = pd.read_csv(config.DATA_FILE)
-        else:
-            df = pd.read_excel(config.DATA_FILE, sheet_name=config.SHEET_NAME)
-    except Exception as e:
-        st.error(f"Chyba profilu: {e}")
-        return pd.DataFrame()
-
-    df.columns = [c.strip() for c in df.columns]
-    rename_map = {
-        config.DATE_COLUMN: 'date',
-        config.SALES_COLUMN: 'y',
-        config.CHANNEL_COLUMN: 'unique_id'
-    }
-    time_col = next((c for c in df.columns if 'Time' in c or 'Closing' in c), None)
-    if time_col: rename_map[time_col] = 'time'
-    df = df.rename(columns=rename_map)
-
-    if 'time' not in df.columns:
-        df['hour'] = 12
-    else:
-        df['hour'] = pd.to_datetime(df['time'].astype(str), errors='coerce').dt.hour.fillna(12).astype(int)
-
-    df['ds'] = pd.to_datetime(df['date'], errors='coerce')
-    df = df.dropna(subset=['ds'])
-    df['dayofweek'] = df['ds'].dt.dayofweek
-    if df['y'].dtype == object:
-        df['y'] = df['y'].astype(str).str.replace(',', '.')
-    df['y'] = pd.to_numeric(df['y'], errors='coerce').fillna(0)
-
-    profile = df.groupby(['unique_id', 'dayofweek', 'hour'])['y'].mean().reset_index()
-    daily_sum = profile.groupby(['unique_id', 'dayofweek'])['y'].transform('sum')
-    profile['share'] = profile['y'] / daily_sum
-    profile = profile.fillna(0)
-    return profile[['unique_id', 'dayofweek', 'hour', 'share']]
-
-import pandas as pd
-import plotly.graph_objects as go
-
-# --- POMOCNÁ FUNKCE: DISTRIBUCE TOTALU DO KANÁLŮ ---
+# --- POMOCNÁ FUNKCE: DISTRIBUCE TOTALU DO KANÁLŮ (Top-Down) ---
 def reconcile_components(df_long):
     """
     Vezme Total a poměrově ho rozdělí mezi ostatní kanály.
@@ -85,35 +44,27 @@ def reconcile_components(df_long):
     ).reset_index()
 
     if 'Total' not in df_wide.columns:
-        return df_long # Pokud chybí Total, vracíme původní
+        return df_long
 
-    # Seznam kanálů (vše kromě ds a Total)
     channels = [c for c in df_wide.columns if c not in ['ds', 'Total']]
-
     if not channels:
         return df_long
 
-    # 1. Součet komponent (jak to vidí model jednotlivě)
+    # 1. Součet komponent (jak to vidí model)
     current_sum = df_wide[channels].sum(axis=1)
     target_total = df_wide['Total']
 
-    # 2. Výpočet poměru (Target / Current)
-    # Ošetření dělení nulou
+    # 2. Výpočet poměru
     ratio = target_total / current_sum
-    ratio = ratio.fillna(1.0) # Kde je suma 0, necháme to být (0 * 1 = 0)
-    # Pokud je suma 0 ale total > 0, nelze rozdělit -> ratio bude inf.
-    # V tom případě nahradíme 0 (kanály zůstanou 0) nebo 1.
-    ratio = ratio.replace([np.inf, -np.inf], 0.0)
+    ratio = ratio.fillna(1.0).replace([np.inf, -np.inf], 0.0)
 
     # 3. Přepočet kanálů
     mask = current_sum != 0
     for c in channels:
-        # Původní hodnota * Ratio
         df_wide.loc[mask, c] = df_wide.loc[mask, c] * ratio[mask]
 
-    # 4. Melt zpátky na Long format (pro grafy a další zpracování)
-    df_final = df_wide.melt(id_vars=['ds'], value_name='Forecast_Value', var_name='unique_id')
-    return df_final
+    # 4. Melt zpátky
+    return df_wide.melt(id_vars=['ds'], value_name='Forecast_Value', var_name='unique_id')
 
 # --- 3. HLAVNÍ APLIKACE ---
 def main():
@@ -122,11 +73,12 @@ def main():
 
     DataLoader, FeatureEngineer, WeatherService, ForecastModel, ModelOptimizer, config = get_engine_modules()
 
-    st.title("BK Dobšice: AI Forecast (Daily -> Hourly)")
-    st.caption(f"Engine: NeuralForecast (TFT) | Režim: Denní model (Auto-Reconcile)")
+    st.title("BK Dobšice: AI Forecast (Daily Only)")
+    st.caption(f"Engine: NeuralForecast (TFT) | Režim: Denní model")
 
     # --- SIDEBAR ---
     st.sidebar.header("⚙️ Nastavení")
+
     with st.spinner("Analyzuji data..."):
         sales_df, _, _, _ = load_data_cached()
         last_hist_date = sales_df['ds'].max()
@@ -235,8 +187,7 @@ def main():
         st.divider()
         st.subheader("3. Výsledky")
 
-        # --- APLIKACE REKONCILIACE (Total -> Channels) ---
-        # Upravíme data v paměti pro zobrazení i export
+        # Aplikace Reconcile (Total -> Kanály)
         sales_viz = reconcile_components(st.session_state['preds_sales'])
         guests_viz = reconcile_components(st.session_state['preds_guests'])
 
@@ -256,69 +207,28 @@ def main():
 
         st.plotly_chart(plot_interactive(hist_sales, sales_viz, sel_id), use_container_width=True)
 
-        st.subheader("4. Export Dat")
-        col_d1, col_d2 = st.columns(2)
+        st.subheader("4. Export Dat (Daily)")
 
-        # --- A) DENNÍ EXPORT (Wide) ---
-        with col_d1:
-            st.markdown("**Denní (Wide)**")
+        # Pivot Table
+        sales_pivot = sales_viz.pivot_table(index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum').reset_index()
+        guests_pivot = guests_viz.pivot_table(index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum').reset_index()
 
-            sales_pivot = sales_viz.pivot_table(
-                index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum'
-            ).reset_index()
+        # Přepočet Totalu v pivotu
+        cols_s = [c for c in sales_pivot.columns if c not in ['ds', 'Total']]
+        if cols_s: sales_pivot['Total'] = sales_pivot[cols_s].sum(axis=1)
 
-            guests_pivot = guests_viz.pivot_table(
-                index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum'
-            ).reset_index()
+        cols_g = [c for c in guests_pivot.columns if c not in ['ds', 'Total']]
+        if cols_g: guests_pivot['Total'] = guests_pivot[cols_g].sum(axis=1)
 
-            sales_pivot['ds'] = sales_pivot['ds'].dt.date
-            guests_pivot['ds'] = guests_pivot['ds'].dt.date
+        sales_pivot['ds'] = sales_pivot['ds'].dt.date
+        guests_pivot['ds'] = guests_pivot['ds'].dt.date
 
-            buffer_daily = io.BytesIO()
-            with pd.ExcelWriter(buffer_daily, engine='openpyxl') as writer:
-                sales_pivot.to_excel(writer, sheet_name='Sales_Daily', index=False)
-                guests_pivot.to_excel(writer, sheet_name='Guests_Daily', index=False)
-            st.download_button("📥 Stáhnout Denní Excel", buffer_daily.getvalue(), "Forecast_Daily.xlsx")
+        buffer_daily = io.BytesIO()
+        with pd.ExcelWriter(buffer_daily, engine='openpyxl') as writer:
+            sales_pivot.to_excel(writer, sheet_name='Sales_Daily', index=False)
+            guests_pivot.to_excel(writer, sheet_name='Guests_Daily', index=False)
 
-        # --- B) HODINOVÝ EXPORT (Wide) ---
-        with col_d2:
-            st.markdown("**Hodinový (Wide)**")
-            if st.button("🔢 Přepočítat na hodiny"):
-                with st.spinner("Počítám..."):
-                    hourly_profile = get_hourly_distribution_profile()
-                    if hourly_profile.empty:
-                        st.error("Chybí profil.")
-                    else:
-                        # Použijeme už opravená (reconciled) data
-                        daily_preds = sales_viz.copy()
-                        daily_preds['dayofweek'] = daily_preds['ds'].dt.dayofweek
-
-                        merged = pd.merge(daily_preds, hourly_profile, on=['unique_id', 'dayofweek'], how='left')
-                        merged['hour'] = merged['hour'].fillna(12).astype(int)
-                        merged['share'] = merged['share'].fillna(0)
-                        merged['Forecast_CZK'] = merged['Forecast_Value'] * merged['share']
-                        merged['Final_Date_Time'] = merged.apply(lambda x: x['ds'] + pd.Timedelta(hours=x['hour']), axis=1)
-
-                        # Pivot na Wide
-                        export_pivot = merged.pivot_table(
-                            index='Final_Date_Time', columns='unique_id', values='Forecast_CZK', aggfunc='sum'
-                        ).reset_index()
-                        export_pivot = export_pivot.sort_values('Final_Date_Time')
-
-                        # Total v hodinovém exportu vznikne automaticky součtem (protože zdrojová data sedí)
-                        # Ale pro jistotu ho můžeme přepočítat
-                        channels_h = [c for c in export_pivot.columns if c not in ['Final_Date_Time', 'Total']]
-                        if channels_h:
-                            export_pivot['Total'] = export_pivot[channels_h].sum(axis=1)
-
-                        buffer_hourly = io.BytesIO()
-                        with pd.ExcelWriter(buffer_hourly, engine='openpyxl') as writer:
-                            export_pivot.to_excel(writer, sheet_name='Hourly_Sales', index=False)
-                        st.session_state['hourly_buffer'] = buffer_hourly
-                        st.success("Hotovo!")
-
-            if 'hourly_buffer' in st.session_state:
-                st.download_button("📥 Stáhnout Hodinový Excel", st.session_state['hourly_buffer'].getvalue(), "Forecast_Hourly.xlsx")
+        st.download_button("📥 Stáhnout Denní Excel", buffer_daily.getvalue(), "Forecast_Daily.xlsx")
 
 if __name__ == "__main__":
     main()

@@ -33,8 +33,8 @@ TFT_PARAMS = {
     'input_size': 120,              # Vidí 4 měsíce historie
 
     # Limit tréninku (cca 50 epoch)
-    'max_steps': 3500,
-    'early_stop_patience_steps': 15, # Zastaví, když se 15x po sobě nezlepší
+    'max_steps': 500,
+    'early_stop_patience_steps': 10, # Zastaví, když se 15x po sobě nezlepší
 
     'learning_rate': 0.0005,        # Pomalejší, ale přesnější učení
     'hidden_size': 128,             # Velký mozek (využije VRAM)
