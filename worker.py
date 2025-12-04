@@ -4,17 +4,13 @@ import logging
 import warnings
 import os
 
-# --- 1. POTLAČENÍ VAROVÁNÍ (SILENCE WARNINGS) ---
-# Potlačení hlášky "No runtime found" od Streamlitu v podprocesech
+# --- 1. POTLAČENÍ VAROVÁNÍ ---
 logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.ERROR)
 logging.getLogger("streamlit.runtime.scriptrunner.script_run_context").setLevel(logging.ERROR)
 logging.getLogger("streamlit").setLevel(logging.ERROR)
-
-# Potlačení Lightning a Torch varování
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 warnings.filterwarnings('ignore')
 
-# Nutné importy pro proces
 from neuralforecast import NeuralForecast
 from neuralforecast.models import TFT
 from neuralforecast.losses.pytorch import HuberMQLoss
@@ -30,21 +26,26 @@ def train_process_worker(params, train_data_dict, horizon, queue):
             train_df['ds'] = pd.to_datetime(train_df['ds'])
 
         # 2. Definice Modelu
+        # Přebíráme parametry z params (včetně fixních z configu)
         model = TFT(
             h=horizon,
-            input_size=params.get('input_size', 60), # Fallback kdyby chybělo
-            hidden_size=params['hidden_size'],
-            learning_rate=params['learning_rate'],
-            dropout=params['dropout'],
-            batch_size=params['batch_size'],
-            max_steps=300,  # Pro Optunu stačí málo kroků
+            input_size=params.get('input_size', 120),
+
+            hidden_size=params['hidden_size'],      # Fix: 128
+            batch_size=params['batch_size'],        # Fix: 64
+            attn_head_size=params.get('attn_head_size', 4), # Fix: 4
+
+            learning_rate=params['learning_rate'],  # Optimalizováno
+            dropout=params['dropout'],              # Optimalizováno
+
+            max_steps=params.get('max_steps', 300), # Fix: 500 (z optimizeru)
+
             loss=HuberMQLoss(quantiles=[0.1, 0.5, 0.9]),
             scaler_type='robust',
             alias='TFT_Optuna',
 
             # --- GPU OPTIMALIZACE ---
             accelerator="gpu",
-            precision="16-mixed",
 
             # --- WINDOWS FIX ---
             num_workers_loader=0,
@@ -55,6 +56,14 @@ def train_process_worker(params, train_data_dict, horizon, queue):
 
         # Pojistka pro Windows
         model.num_workers_loader = 0
+
+        # Pojistka pro Trainer args (aby nedocházelo k chybě trainer_kwargs)
+        model.trainer_kwargs = {
+            'accelerator': 'gpu',
+            'max_steps': params.get('max_steps', 300),
+            'enable_model_summary': False,
+            'enable_progress_bar': False
+        }
 
         # 3. Trénink
         nf = NeuralForecast(models=[model], freq='D')

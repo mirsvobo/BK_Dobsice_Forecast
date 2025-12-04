@@ -1,5 +1,4 @@
 import os
-import sys
 import streamlit as st
 import io
 import numpy as np
@@ -35,12 +34,12 @@ def get_weather_cached(lat, lon, start, end):
 # --- POMOCNÁ FUNKCE: DISTRIBUCE TOTALU DO KANÁLŮ (Top-Down) ---
 def reconcile_components(df_long):
     """
-    Vezme Total a poměrově ho rozdělí mezi ostatní kanály.
-    Zajistí: Sum(Channels) == Total
+    Vezme predikci pro 'Total' a poměrově ji rozdělí mezi ostatní kanály.
+    Zajistí: Sum(Kanály) == Total
     """
     # Pivot na Wide (řádky=Datum, sloupce=Kanály)
     df_wide = df_long.pivot_table(
-        index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum'
+        index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum', fill_value=0
     ).reset_index()
 
     if 'Total' not in df_wide.columns:
@@ -50,11 +49,11 @@ def reconcile_components(df_long):
     if not channels:
         return df_long
 
-    # 1. Součet komponent (jak to vidí model)
+    # 1. Součet komponent (jak to vidí model jednotlivě)
     current_sum = df_wide[channels].sum(axis=1)
     target_total = df_wide['Total']
 
-    # 2. Výpočet poměru
+    # 2. Výpočet poměru (Kolikrát musíme kanály zvětšit/zmenšit, aby daly Total)
     ratio = target_total / current_sum
     ratio = ratio.fillna(1.0).replace([np.inf, -np.inf], 0.0)
 
@@ -63,7 +62,7 @@ def reconcile_components(df_long):
     for c in channels:
         df_wide.loc[mask, c] = df_wide.loc[mask, c] * ratio[mask]
 
-    # 4. Melt zpátky
+    # 4. Melt zpátky na Long format (pro grafy)
     return df_wide.melt(id_vars=['ds'], value_name='Forecast_Value', var_name='unique_id')
 
 # --- 3. HLAVNÍ APLIKACE ---
@@ -74,7 +73,7 @@ def main():
     DataLoader, FeatureEngineer, WeatherService, ForecastModel, ModelOptimizer, config = get_engine_modules()
 
     st.title("BK Dobšice: AI Forecast (Daily Only)")
-    st.caption(f"Engine: NeuralForecast (TFT) | Režim: Denní model")
+    st.caption(f"Engine: NeuralForecast (TFT) | Režim: Denní model | Výstup: Celá čísla")
 
     # --- SIDEBAR ---
     st.sidebar.header("⚙️ Nastavení")
@@ -95,8 +94,9 @@ def main():
     force_retrain = st.sidebar.checkbox("Vynutit přetrénování", value=False)
 
     # KPI
-    S, tags = DataLoader.get_hierarchy_matrix(sales_df)
     unique_ids = list(sales_df['unique_id'].unique())
+    # S a tags potřebujeme pro trénink, i když je nepoužijeme v grafu
+    S, tags = DataLoader.get_hierarchy_matrix(sales_df)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Historie do", last_hist_date.strftime('%d.%m.%Y'))
@@ -110,10 +110,12 @@ def main():
         st.info("Klikni pro přípravu dat.")
 
     if st.button("🔄 Spustit Data Pipeline"):
-        with st.spinner("Stahuji počasí..."):
+        with st.spinner("Stahuji počasí a připravuji features..."):
+            # Znovu načteme čerstvá data
             sales_df, guests_df, lat, lon = load_data_cached()
 
             train_end_dt = pd.to_datetime(forecast_start_date)
+            # Rezerva pro počasí
             forecast_end_dt = train_end_dt + pd.Timedelta(days=config.TFT_PARAMS['h'] + 10)
             weather_df = get_weather_cached(lat, lon, config.TRAIN_START_DATE, str(forecast_end_dt))
 
@@ -145,7 +147,7 @@ def main():
                 model_loaded = False
 
                 if not force_retrain:
-                    status.write("Hledám model...")
+                    status.write("Hledám uložený model...")
                     model_loaded = model.load_model(config.MODEL_CHECKPOINT_DIR)
 
                 if not model_loaded:
@@ -158,7 +160,7 @@ def main():
                     model = ForecastModel(best_params=best_params)
                     model.train(train_sales, train_guests)
                     model.save_model(config.MODEL_CHECKPOINT_DIR)
-                    status.write("Uloženo.")
+                    status.write("Model uložen.")
 
                 status.write("Generuji předpověď...")
                 horizon = config.TFT_PARAMS['h']
@@ -187,7 +189,7 @@ def main():
         st.divider()
         st.subheader("3. Výsledky")
 
-        # Aplikace Reconcile (Total -> Kanály)
+        # --- APLIKACE REKONCILIACE (Total rozpadne poměrově do kanálů) ---
         sales_viz = reconcile_components(st.session_state['preds_sales'])
         guests_viz = reconcile_components(st.session_state['preds_guests'])
 
@@ -207,28 +209,42 @@ def main():
 
         st.plotly_chart(plot_interactive(hist_sales, sales_viz, sel_id), use_container_width=True)
 
-        st.subheader("4. Export Dat (Daily)")
+        st.subheader("4. Export Dat")
 
-        # Pivot Table
-        sales_pivot = sales_viz.pivot_table(index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum').reset_index()
-        guests_pivot = guests_viz.pivot_table(index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum').reset_index()
+        # PIVOT TABLES (Denní báze)
+        sales_pivot = sales_viz.pivot_table(index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum', fill_value=0).reset_index()
+        guests_pivot = guests_viz.pivot_table(index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum', fill_value=0).reset_index()
 
-        # Přepočet Totalu v pivotu
+        # Přepočet Totalu v pivotu (pro jistotu)
         cols_s = [c for c in sales_pivot.columns if c not in ['ds', 'Total']]
         if cols_s: sales_pivot['Total'] = sales_pivot[cols_s].sum(axis=1)
 
         cols_g = [c for c in guests_pivot.columns if c not in ['ds', 'Total']]
         if cols_g: guests_pivot['Total'] = guests_pivot[cols_g].sum(axis=1)
 
+        # --- PŘEVOD NA INTEGER (Celá čísla) ---
+        num_s = [c for c in sales_pivot.columns if c != 'ds']
+        sales_pivot[num_s] = sales_pivot[num_s].round(0).astype(int)
+
+        num_g = [c for c in guests_pivot.columns if c != 'ds']
+        guests_pivot[num_g] = guests_pivot[num_g].round(0).astype(int)
+
+        # Formát data
         sales_pivot['ds'] = sales_pivot['ds'].dt.date
         guests_pivot['ds'] = guests_pivot['ds'].dt.date
 
-        buffer_daily = io.BytesIO()
-        with pd.ExcelWriter(buffer_daily, engine='openpyxl') as writer:
-            sales_pivot.to_excel(writer, sheet_name='Sales_Daily', index=False)
-            guests_pivot.to_excel(writer, sheet_name='Guests_Daily', index=False)
+        # ULOŽENÍ DO JEDNOHO EXCELU
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            sales_pivot.to_excel(writer, sheet_name='Sales_Forecast', index=False)
+            guests_pivot.to_excel(writer, sheet_name='Transactions_Forecast', index=False)
 
-        st.download_button("📥 Stáhnout Denní Excel", buffer_daily.getvalue(), "Forecast_Daily.xlsx")
+        st.download_button(
+            label="📥 Stáhnout Predikci (.xlsx)",
+            data=buffer.getvalue(),
+            file_name="BK_Forecast_Daily.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
 if __name__ == "__main__":
     main()

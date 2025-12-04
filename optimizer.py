@@ -3,6 +3,7 @@ import pandas as pd
 import multiprocessing
 import logging
 import importlib
+import config  # Importujeme config pro načtení fixních parametrů
 
 # Potlačení logů
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
@@ -17,16 +18,24 @@ class ModelOptimizer:
     def objective(self, trial):
         # --- FIX PICKLING ERROR ---
         # Importujeme worker až TADY a vynutíme reload.
-        # Tím zajistíme, že multiprocessing dostane správný odkaz na funkci.
         import worker
         importlib.reload(worker)
 
         # 1. Návrh parametrů
+        # Hledáme jen LR a Dropout. Ostatní parametry držíme pevně podle Configu (RTX 5070).
         params = {
+            # Proměnné (hledané) parametry
             "learning_rate": trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
-            "hidden_size": trial.suggest_categorical("hidden_size", [64, 128]),
             "dropout": trial.suggest_float("dropout", 0.1, 0.4),
-            "batch_size": 32 # Pro optimalizaci stačí menší batch
+
+            # Fixní parametry (Výkonnostní metriky z Configu)
+            "hidden_size": config.TFT_PARAMS['hidden_size'],       # 128
+            "batch_size": config.TFT_PARAMS['batch_size'],         # 64
+            "attn_head_size": config.TFT_PARAMS['attn_head_size'], # 4
+            "input_size": config.TFT_PARAMS['input_size'],         # 120
+
+            # Pro optimalizaci zkrátíme trénink (stačí porovnat konvergenci)
+            "max_steps": 500
         }
 
         # 2. Serializace dat (DataFrame -> Dict) pro přenos do procesu
@@ -38,7 +47,6 @@ class ModelOptimizer:
         # Windows vyžaduje 'spawn'
         ctx = multiprocessing.get_context('spawn')
 
-        # Použijeme worker.train_process_worker (z modulu, ne z importu nahoře)
         process = ctx.Process(
             target=worker.train_process_worker,
             args=(params, train_data_dict, self.horizon, queue)
@@ -60,8 +68,18 @@ class ModelOptimizer:
 
     def optimize(self):
         print(f"INFO: Spouštím optimalizaci (Optuna)...")
+        print(f"      Fixované parametry: BS={config.TFT_PARAMS['batch_size']}, Hidden={config.TFT_PARAMS['hidden_size']}")
+
         study = optuna.create_study(direction="minimize")
         study.optimize(self.objective, n_trials=self.n_trials)
 
         print(f"INFO: Nejlepší parametry: {study.best_params}")
-        return study.best_params
+
+        # Do výsledku vrátíme i ty fixní, aby je ForecastModel mohl použít
+        best = study.best_params.copy()
+        best.update({
+            'hidden_size': config.TFT_PARAMS['hidden_size'],
+            'batch_size': config.TFT_PARAMS['batch_size'],
+            'attn_head_size': config.TFT_PARAMS['attn_head_size']
+        })
+        return best

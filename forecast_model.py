@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 import torch
 import os
 import gc
@@ -34,15 +33,18 @@ class ForecastModel:
             print(f"   [ForecastModel] GPU: {torch.cuda.get_device_name(0)} | Batch: {self.params['batch_size']} | Steps Limit: {self.params['max_steps']}")
 
     def _build_models_list(self):
-        # --- FIX: Obejítí chyby s ignorováním max_steps ---
+        # --- FIX: Definice parametrů pro Trainer ---
         trainer_args = {
-            'max_steps': self.params['max_steps'], # Zde se definuje limit!
+            'max_steps': self.params['max_steps'], # Limit kroků
             'accelerator': self.accelerator,
             'enable_model_summary': False,
             'enable_progress_bar': True,
             'check_val_every_n_epoch': 1
         }
 
+        # --- FIX: Inicializace modelu BEZ trainer_kwargs v konstruktoru ---
+        # Pokud bychom je předali do __init__, mohly by se zanořit do kwargs jako {'trainer_kwargs': {...}},
+        # což způsobí pád při inicializaci pl.Trainer.
         tft_model = TFT(
             h=self.params['h'],
             input_size=self.params['input_size'],
@@ -52,17 +54,18 @@ class ForecastModel:
             learning_rate=self.params['learning_rate'],
             scaler_type=self.params['scaler_type'],
             batch_size=self.params['batch_size'],
-            dropout=self.params['dropout'], # Přidán dropout
+            dropout=self.params['dropout'],
             loss=self.loss,
             futr_exog_list=config.FUTR_EXOG_LIST,
             alias='TFT_Model',
 
             # Early Stopping (Model level)
-            early_stop_patience_steps=self.params['early_stop_patience_steps'],
-
-            # Trainer parametry posíláme tudy
-            trainer_kwargs=trainer_args
+            early_stop_patience_steps=self.params['early_stop_patience_steps']
         )
+
+        # --- FIX: Ruční přiřazení trainer_kwargs ---
+        # Tímto zajistíme, že pl.Trainer(**model.trainer_kwargs) dostane správné argumenty.
+        tft_model.trainer_kwargs = trainer_args
 
         # Windows Fix
         tft_model.num_workers_loader = 0
