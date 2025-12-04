@@ -1,12 +1,17 @@
 import os
+import sys
 import streamlit as st
 import io
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import torch  # Přidán import
 
 # --- 1. ENVIRONMENT & CONFIG ---
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+
+# --- PERFORMANCE BOOST PRO RTX 40xx/50xx ---
+torch.set_float32_matmul_precision('medium')
 
 # --- 2. MODULES ---
 def get_engine_modules():

@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import torch
 import os
 import gc
@@ -13,6 +14,9 @@ import warnings
 
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 warnings.filterwarnings('ignore')
+
+# --- PERFORMANCE BOOST ---
+torch.set_float32_matmul_precision('medium')
 
 class ForecastModel:
     def __init__(self, best_params=None):
@@ -43,8 +47,6 @@ class ForecastModel:
         }
 
         # --- FIX: Inicializace modelu BEZ trainer_kwargs v konstruktoru ---
-        # Pokud bychom je předali do __init__, mohly by se zanořit do kwargs jako {'trainer_kwargs': {...}},
-        # což způsobí pád při inicializaci pl.Trainer.
         tft_model = TFT(
             h=self.params['h'],
             input_size=self.params['input_size'],
@@ -64,7 +66,6 @@ class ForecastModel:
         )
 
         # --- FIX: Ruční přiřazení trainer_kwargs ---
-        # Tímto zajistíme, že pl.Trainer(**model.trainer_kwargs) dostane správné argumenty.
         tft_model.trainer_kwargs = trainer_args
 
         # Windows Fix

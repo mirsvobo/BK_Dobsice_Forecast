@@ -11,6 +11,9 @@ logging.getLogger("streamlit").setLevel(logging.ERROR)
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 warnings.filterwarnings('ignore')
 
+# --- PERFORMANCE BOOST ---
+torch.set_float32_matmul_precision('medium')
+
 from neuralforecast import NeuralForecast
 from neuralforecast.models import TFT
 from neuralforecast.losses.pytorch import HuberMQLoss
