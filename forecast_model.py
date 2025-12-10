@@ -12,6 +12,7 @@ from hierarchicalforecast.methods import BottomUp
 import logging
 import warnings
 
+# Potlačení logů
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 warnings.filterwarnings('ignore')
 
@@ -36,20 +37,22 @@ class ForecastModel:
             gc.collect()
             print(f"   [ForecastModel] GPU: {torch.cuda.get_device_name(0)} | Batch: {self.params['batch_size']} | Steps Limit: {self.params['max_steps']}")
 
-    def _build_models_list(self):
-        # --- FIX: Definice parametrů pro Trainer ---
+    def _build_model(self, callbacks=None):
+        """
+        Sestaví instanci modelu TFT.
+        Pokud jsou předány callbacks (např. pro Streamlit UI), vloží je do trainer_kwargs.
+        """
+        # --- Definice parametrů pro Trainer ---
         trainer_args = {
             'max_steps': self.params['max_steps'],
             'accelerator': self.accelerator,
             'enable_model_summary': False,
-            'enable_progress_bar': True,
-
-            # --- ZRYCHLENÍ: Validace jen jednou za 100 epoch, ne každou! ---
-            # Toto odstraní "zasekávání" po každém kroku
-            'check_val_every_n_epoch': 100
+            'enable_progress_bar': False, # Vypneme defaultní konzolový bar, máme vlastní UI
+            'check_val_every_n_epoch': 100,
+            'callbacks': callbacks if callbacks else [] # Zde vkládáme náš StreamlitCallback
         }
 
-        # --- FIX: Inicializace modelu BEZ trainer_kwargs v konstruktoru ---
+        # --- Inicializace modelu TFT ---
         tft_model = TFT(
             h=self.params['h'],
             input_size=self.params['input_size'],
@@ -68,24 +71,68 @@ class ForecastModel:
             early_stop_patience_steps=self.params['early_stop_patience_steps']
         )
 
-        # --- FIX: Ruční přiřazení trainer_kwargs ---
+        # --- Ruční přiřazení trainer_kwargs ---
         tft_model.trainer_kwargs = trainer_args
 
         # Windows Fix
         tft_model.num_workers_loader = 0
         tft_model.drop_last_loader = False
 
-        return [tft_model]
+        return tft_model
 
-    def train(self, df_sales, df_guests):
+    def train(self, df_sales, df_guests, ui_callback_cls=None, ui_container=None):
+        """
+        Spustí trénink modelů pro Sales a Guests.
+
+        Args:
+            df_sales: Dataframe prodeje
+            df_guests: Dataframe hosté
+            ui_callback_cls: Třída PLTrainingUI (volitelné)
+            ui_container: Hlavní Streamlit kontejner pro vykreslování (volitelné)
+        """
+
+        # --- 1. Trénink SALES ---
         print(f"INFO: Startuji trénink (Sales). Limit kroků: {self.params['max_steps']}...")
-        self.nf_sales = NeuralForecast(models=self._build_models_list(), freq=config.FREQ)
+
+        callbacks_sales = []
+        if ui_callback_cls and ui_container:
+            # Vytvoříme sub-kontejner pro Sales
+            st_cont = ui_container.container()
+            st_cont.markdown("### 🍟 Trénuji model: Tržby (Sales)")
+
+            # Inicializace callbacku
+            cb = ui_callback_cls(
+                total_steps=self.params['max_steps'],
+                container=st_cont
+            )
+            callbacks_sales.append(cb)
+
+        model_sales = self._build_model(callbacks=callbacks_sales)
+        self.nf_sales = NeuralForecast(models=[model_sales], freq=config.FREQ)
         self.nf_sales.fit(df=df_sales, val_size=self.params['h'])
 
         torch.cuda.empty_cache()
 
+        # --- 2. Trénink GUESTS ---
         print(f"INFO: Startuji trénink (Guests). Limit kroků: {self.params['max_steps']}...")
-        self.nf_guests = NeuralForecast(models=self._build_models_list(), freq=config.FREQ)
+
+        callbacks_guests = []
+        if ui_callback_cls and ui_container:
+            ui_container.markdown("---") # Oddělovací čára v UI
+
+            # Vytvoříme sub-kontejner pro Guests
+            st_cont = ui_container.container()
+            st_cont.markdown("### 👥 Trénuji model: Transakce (Guests)")
+
+            # Inicializace callbacku
+            cb = ui_callback_cls(
+                total_steps=self.params['max_steps'],
+                container=st_cont
+            )
+            callbacks_guests.append(cb)
+
+        model_guests = self._build_model(callbacks=callbacks_guests)
+        self.nf_guests = NeuralForecast(models=[model_guests], freq=config.FREQ)
         self.nf_guests.fit(df=df_guests, val_size=self.params['h'])
 
         torch.cuda.empty_cache()

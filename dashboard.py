@@ -5,12 +5,10 @@ import io
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import torch  # Přidán import
+import torch
 
 # --- 1. ENVIRONMENT & CONFIG ---
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
-
-# --- PERFORMANCE BOOST PRO RTX 40xx/50xx ---
 torch.set_float32_matmul_precision('medium')
 
 # --- 2. MODULES ---
@@ -21,7 +19,9 @@ def get_engine_modules():
     from forecast_model import ForecastModel
     from optimizer import ModelOptimizer
     import config
-    return DataLoader, FeatureEngineer, WeatherService, ForecastModel, ModelOptimizer, config
+    # Import nových UI layoutů
+    from ui_layouts import PLTrainingUI, OptunaStreamlitCallback
+    return DataLoader, FeatureEngineer, WeatherService, ForecastModel, ModelOptimizer, config, PLTrainingUI, OptunaStreamlitCallback
 
 # --- CACHED DATA LOADERS ---
 @st.cache_data
@@ -36,7 +36,7 @@ def get_weather_cached(lat, lon, start, end):
     ws = WeatherService()
     return ws.get_weather_data(lat, lon, str(start), str(end))
 
-# --- POMOCNÁ FUNKCE: DISTRIBUCE TOTALU DO KANÁLŮ (Top-Down) ---
+# --- POMOCNÁ FUNKCE: DISTRIBUCE TOTALU DO KANÁLŮ ---
 def reconcile_components(df_long):
     """
     Vezme predikci pro 'Total' a poměrově ji rozdělí mezi ostatní kanály.
@@ -75,10 +75,16 @@ def main():
     st.set_page_config(page_title="BK Forecast AI", layout="wide")
     st.markdown("""<style>h1 { color: #D62300; }.stButton>button { background-color: #D62300; color: white; font-weight: bold; border-radius: 8px; }</style>""", unsafe_allow_html=True)
 
-    DataLoader, FeatureEngineer, WeatherService, ForecastModel, ModelOptimizer, config = get_engine_modules()
+    DataLoader, FeatureEngineer, WeatherService, ForecastModel, ModelOptimizer, config, PLTrainingUI, OptunaStreamlitCallback = get_engine_modules()
 
-    st.title("BK Dobšice: AI Forecast (Daily Only)")
-    st.caption(f"Engine: NeuralForecast (TFT) | Režim: Denní model | Výstup: Celá čísla")
+    st.title("BK Dobšice: AI Forecast (RTX 5070 Ed.)")
+
+    # Detekce HW
+    hw_info = "CPU Mode"
+    if torch.cuda.is_available():
+        hw_info = f"GPU: {torch.cuda.get_device_name(0)}"
+
+    st.caption(f"Engine: NeuralForecast (TFT) | {hw_info} | Batch Size: {config.TFT_PARAMS['batch_size']}")
 
     # --- SIDEBAR ---
     st.sidebar.header("⚙️ Nastavení")
@@ -95,12 +101,24 @@ def main():
     )
 
     st.sidebar.caption(f"Horizont: {config.TFT_PARAMS['h']} dní")
-    use_optimization = st.sidebar.checkbox("Zapnout Optunu", value=False)
+
+    st.sidebar.divider()
+    # Optuna nastavení
+    use_optuna = st.sidebar.checkbox(
+        "Zapnout Optunu (Auto-Tuning)",
+        value=False,
+        help="Hledá nejlepší parametry. Spustí více tréninků, zobrazí výsledky."
+    )
+
+    # Pokud je Optuna zapnutá, ukážeme slider pro počet pokusů
+    optuna_trials = 0
+    if use_optuna:
+        optuna_trials = st.sidebar.slider("Počet pokusů Optuny", min_value=5, max_value=50, value=10)
+
     force_retrain = st.sidebar.checkbox("Vynutit přetrénování", value=False)
 
     # KPI
     unique_ids = list(sales_df['unique_id'].unique())
-    # S a tags potřebujeme pro trénink, i když je nepoužijeme v grafu
     S, tags = DataLoader.get_hierarchy_matrix(sales_df)
 
     c1, c2, c3 = st.columns(3)
@@ -116,11 +134,9 @@ def main():
 
     if st.button("🔄 Spustit Data Pipeline"):
         with st.spinner("Stahuji počasí a připravuji features..."):
-            # Znovu načteme čerstvá data
             sales_df, guests_df, lat, lon = load_data_cached()
 
             train_end_dt = pd.to_datetime(forecast_start_date)
-            # Rezerva pro počasí
             forecast_end_dt = train_end_dt + pd.Timedelta(days=config.TFT_PARAMS['h'] + 10)
             weather_df = get_weather_cached(lat, lon, config.TRAIN_START_DATE, str(forecast_end_dt))
 
@@ -138,8 +154,11 @@ def main():
     # 2. MODEL
     if st.session_state.get('fe_done'):
         st.divider()
-        if st.button("🚀 Spustit Predikci (TFT)", type="primary"):
-            status = st.status("Pracuji...", expanded=True)
+        if st.button("🚀 Spustit Trénink a Predikci", type="primary"):
+
+            # --- HLAVNÍ KONTEJNER PRO VIZUALIZACI ---
+            viz_container = st.container()
+
             try:
                 train_cutoff = pd.to_datetime(forecast_start_date)
                 if train_cutoff > next_day:
@@ -152,22 +171,49 @@ def main():
                 model_loaded = False
 
                 if not force_retrain:
-                    status.write("Hledám uložený model...")
+                    with viz_container:
+                        st.info("🔎 Hledám uložený model...")
                     model_loaded = model.load_model(config.MODEL_CHECKPOINT_DIR)
 
                 if not model_loaded:
-                    status.write("Trénuji model...")
                     best_params = None
-                    if use_optimization:
-                        optimizer = ModelOptimizer(train_sales, horizon=config.TFT_PARAMS['h'], n_trials=10)
-                        best_params = optimizer.optimize()
 
-                    model = ForecastModel(best_params=best_params)
-                    model.train(train_sales, train_guests)
-                    model.save_model(config.MODEL_CHECKPOINT_DIR)
-                    status.write("Model uložen.")
+                    # --- A) OPTUNA VIZUALIZACE ---
+                    if use_optuna:
+                        optuna_cont = viz_container.container()
+                        with optuna_cont:
+                            # Inicializace callbacku pro Optunu
+                            optuna_cb = OptunaStreamlitCallback(optuna_cont, optuna_trials)
 
-                status.write("Generuji předpověď...")
+                            optimizer = ModelOptimizer(train_sales, horizon=config.TFT_PARAMS['h'], n_trials=optuna_trials)
+
+                            # Spuštění s callbackem
+                            best_params = optimizer.optimize(streamlit_callback=optuna_cb)
+
+                            st.success(f"✅ Optuna dokončena! Nejlepší parametry: {best_params}")
+                            st.divider()
+
+                    # --- B) FINÁLNÍ TRÉNINK VIZUALIZACE ---
+                    training_cont = viz_container.container()
+                    with training_cont:
+                        training_cont.markdown("## 🏭 Produkční Trénink Modelu")
+
+                        # Vlastní trénink s UI vizualizací
+                        model = ForecastModel(best_params=best_params)
+                        model.train(
+                            train_sales,
+                            train_guests,
+                            ui_callback_cls=PLTrainingUI,
+                            ui_container=training_cont
+                        )
+
+                        model.save_model(config.MODEL_CHECKPOINT_DIR)
+                        st.success("✅ Model natrénován a uložen.")
+
+                # 3. PREDIKCE
+                with viz_container:
+                    st.info("🔮 Generuji předpověď do budoucnosti...")
+
                 horizon = config.TFT_PARAMS['h']
                 dates = pd.date_range(start=train_cutoff, periods=horizon, freq='D')
 
@@ -182,11 +228,14 @@ def main():
                 p_sales, p_guests = model.predict(future_aug, S, tags)
                 st.session_state['preds_sales'] = p_sales
                 st.session_state['preds_guests'] = p_guests
-                status.update(label="Hotovo! ✅", state="complete", expanded=False)
+
+                with viz_container:
+                    st.success("Hotovo! Výsledky jsou níže.")
+                    st.balloons()
 
             except Exception as e:
-                status.update(label="Chyba!", state="error")
-                st.error(f"Chyba: {e}")
+                viz_container.error("Nastala chyba!")
+                st.error(f"Detaily chyby: {e}")
                 st.exception(e)
 
     # 3. VÝSLEDKY & EXPORT
@@ -194,7 +243,6 @@ def main():
         st.divider()
         st.subheader("3. Výsledky")
 
-        # --- APLIKACE REKONCILIACE (Total rozpadne poměrově do kanálů) ---
         sales_viz = reconcile_components(st.session_state['preds_sales'])
         guests_viz = reconcile_components(st.session_state['preds_guests'])
 
@@ -206,39 +254,49 @@ def main():
             start_view = last_date - pd.Timedelta(days=60)
             hist = df_hist[(df_hist['unique_id'] == unique_id) & (df_hist['ds'] >= start_view)]
             pred = df_pred[df_pred['unique_id'] == unique_id]
+
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=hist['ds'], y=hist['y'], mode='lines', name='Historie', line=dict(color='black', width=1)))
+            # Historie
+            fig.add_trace(go.Scatter(x=hist['ds'], y=hist['y'], mode='lines', name='Historie', line=dict(color='gray', width=1)))
+            # Predikce
             fig.add_trace(go.Scatter(x=pred['ds'], y=pred['Forecast_Value'], mode='lines+markers', name='AI Predikce', line=dict(color='#D62300', width=3)))
+
+            # Confidence Interval (stínování)
+            if 'y_pred_low' in pred.columns:
+                fig.add_trace(go.Scatter(
+                    x=pd.concat([pred['ds'], pred['ds'][::-1]]),
+                    y=pd.concat([pred['y_pred_high'], pred['y_pred_low'][::-1]]),
+                    fill='toself',
+                    fillcolor='rgba(214, 35, 0, 0.1)',
+                    line=dict(color='rgba(255,255,255,0)'),
+                    hoverinfo="skip",
+                    showlegend=False
+                ))
+
             fig.update_layout(title=f"Prognóza: {unique_id}", height=500, template="plotly_white")
             return fig
 
         st.plotly_chart(plot_interactive(hist_sales, sales_viz, sel_id), use_container_width=True)
 
         st.subheader("4. Export Dat")
-
-        # PIVOT TABLES (Denní báze)
         sales_pivot = sales_viz.pivot_table(index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum', fill_value=0).reset_index()
         guests_pivot = guests_viz.pivot_table(index='ds', columns='unique_id', values='Forecast_Value', aggfunc='sum', fill_value=0).reset_index()
 
-        # Přepočet Totalu v pivotu (pro jistotu)
         cols_s = [c for c in sales_pivot.columns if c not in ['ds', 'Total']]
         if cols_s: sales_pivot['Total'] = sales_pivot[cols_s].sum(axis=1)
 
         cols_g = [c for c in guests_pivot.columns if c not in ['ds', 'Total']]
         if cols_g: guests_pivot['Total'] = guests_pivot[cols_g].sum(axis=1)
 
-        # --- PŘEVOD NA INTEGER (Celá čísla) ---
+        # Rounding & Int
         num_s = [c for c in sales_pivot.columns if c != 'ds']
         sales_pivot[num_s] = sales_pivot[num_s].round(0).astype(int)
-
         num_g = [c for c in guests_pivot.columns if c != 'ds']
         guests_pivot[num_g] = guests_pivot[num_g].round(0).astype(int)
 
-        # Formát data
         sales_pivot['ds'] = sales_pivot['ds'].dt.date
         guests_pivot['ds'] = guests_pivot['ds'].dt.date
 
-        # ULOŽENÍ DO JEDNOHO EXCELU
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
             sales_pivot.to_excel(writer, sheet_name='Sales_Forecast', index=False)
