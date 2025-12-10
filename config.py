@@ -26,25 +26,22 @@ CHANNEL_COLUMN = 'Sales Channel'
 # --- 4. Konfigurace prognózy ---
 TRAIN_START_DATE = '2021-02-01'
 FREQ = 'D'
-FORECAST_START = '2024-05-01' # Příklad, upravte dle potřeby dashboardu
-FORECAST_END = '2024-07-01'   # Příklad
+FORECAST_START = '2025-12-01' # Příklad
+FORECAST_END = '2025-12-31'   # Příklad
 
-# --- 5. PARAMETRY MODELU (High Performance / 12GB VRAM) ---
-# Optimalizováno pro: NVIDIA RTX 5070 12GB + Ryzen 7 9700X
 TFT_PARAMS = {
-    'h': 60,                        # Předpověď na 2 měsíce
-    'input_size': 120,              # Vidí 4 měsíce historie
+    'h': 60,                        #
+    'input_size': 120,
 
-    # Limit tréninku (Pro rychlou RTX kartu můžeme dovolit více kroků)
-    'max_steps': 1000,
-    'early_stop_patience_steps': 15, # Vyšší trpělivost pro delší trénink
-
-    'learning_rate': 0.0005,        # Pomalejší, ale přesnější učení
-    'hidden_size': 128,             # [MAX] Velký mozek, 128 je limit pro 12GB VRAM při tomto input_size
-    'batch_size': 64,               # [SAFE] 64 je bezpečné pro 12GB. 128 by mohlo spadnout (OOM).
-    'scaler_type': 'robust',        # Odolné proti extrémům (Vánoce)
-    'dropout': 0.15,                # Mírně nižší dropout, máme dost dat a kroků
-    'attn_head_size': 4,            # Standard pro hidden_size 128
+    # Limit tréninku - SNÍŽENO pro rychlost
+    'max_steps': 300,
+    'early_stop_patience_steps': 10,
+    'learning_rate': 0.0005,
+    'hidden_size': 128,
+    'batch_size': 128,
+    'scaler_type': 'robust',
+    'dropout': 0.15,
+    'attn_head_size': 4,
 }
 
 TRAINER_KWARGS = {

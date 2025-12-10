@@ -39,11 +39,14 @@ class ForecastModel:
     def _build_models_list(self):
         # --- FIX: Definice parametrů pro Trainer ---
         trainer_args = {
-            'max_steps': self.params['max_steps'], # Limit kroků
+            'max_steps': self.params['max_steps'],
             'accelerator': self.accelerator,
             'enable_model_summary': False,
             'enable_progress_bar': True,
-            'check_val_every_n_epoch': 1
+
+            # --- ZRYCHLENÍ: Validace jen jednou za 100 epoch, ne každou! ---
+            # Toto odstraní "zasekávání" po každém kroku
+            'check_val_every_n_epoch': 100
         }
 
         # --- FIX: Inicializace modelu BEZ trainer_kwargs v konstruktoru ---
