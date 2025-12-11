@@ -23,21 +23,18 @@ class DummyContainer:
     def line_chart(self, *args, **kwargs): pass
     def write(self, *args): pass
 
-# [NOVÉ] Vylepšený logger s výpočtem ETA a průměrné rychlosti
 class JSONLoggerCallback(Callback):
     def __init__(self, total_steps, container=None):
         self.total_steps = total_steps
         self.start_time = None
         self.last_time = None
-        self.log_every_n_steps = 10 # Posíláme častěji pro plynulost
-
-        # Pro vyhlazení rychlosti (klouzavý průměr)
+        self.log_every_n_steps = 10 # Méně časté logování šetří CPU
         self.recent_times = []
 
     def on_train_start(self, trainer, pl_module):
         self.start_time = time.time()
         self.last_time = self.start_time
-        print(json.dumps({"type": "status", "msg": "🚀 Inicializace GPU a tenzorů..."}), flush=True)
+        print(json.dumps({"type": "status", "msg": "🚀 Startuji trénink (Optimized Types)..."}), flush=True)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         loss = outputs.get('loss')
@@ -46,25 +43,20 @@ class JSONLoggerCallback(Callback):
         step = trainer.global_step
         current_time = time.time()
 
-        # Aktualizujeme každých N kroků nebo na konci
         if step % self.log_every_n_steps == 0 or step >= self.total_steps:
             loss_val = loss.item() if hasattr(loss, 'item') else float(loss)
-
-            # 1. Výpočet času od startu
             total_elapsed = current_time - self.start_time
 
-            # 2. Výpočet rychlosti (kroky za sekundu) - vyhlazené
             step_time = current_time - self.last_time
             if step_time > 0:
                 self.recent_times.append(step_time)
-                if len(self.recent_times) > 10: self.recent_times.pop(0)
+                if len(self.recent_times) > 20: self.recent_times.pop(0)
                 avg_step_time = sum(self.recent_times) / len(self.recent_times)
                 steps_per_sec = 1.0 / avg_step_time
             else:
                 steps_per_sec = 0.0
                 avg_step_time = 0.0
 
-            # 3. Výpočet ETA (Remaining Time)
             remaining_steps = self.total_steps - step
             eta_seconds = remaining_steps * avg_step_time if avg_step_time > 0 else 0
 
@@ -74,13 +66,37 @@ class JSONLoggerCallback(Callback):
                 "total": self.total_steps,
                 "loss": loss_val,
                 "time": total_elapsed,
-                "speed": steps_per_sec,      # kroky/s
-                "avg_time": avg_step_time,   # s/krok
-                "eta": eta_seconds           # zbývající čas v sekundách
+                "speed": steps_per_sec,
+                "eta": eta_seconds
             }
             print(json.dumps(log_data), flush=True)
+            self.last_time = current_time
 
-        self.last_time = current_time
+def optimize_types(df):
+    """
+    Agresivní optimalizace paměti podle instrukcí uživatele.
+    """
+    # 1. Datum
+    if 'ds' in df.columns:
+        df['ds'] = pd.to_datetime(df['ds'])
+
+    # 2. Cílová proměnná 'y' (čísla do statisíců)
+    # NeuralForecast vyžaduje float, ale float32 stačí (přesnost na celá čísla do 16 mil.)
+    if 'y' in df.columns:
+        df['y'] = df['y'].astype('float32')
+
+    # 3. Binární features (0/1) -> int8 (nejmenší možný typ)
+    # Hledáme sloupce začínající na 'is_'
+    for col in df.columns:
+        if col.startswith('is_'):
+            df[col] = df[col].astype('int8')
+
+    # 4. Ostatní floaty (sin_day, cos_day) -> float32
+    # Tyto musí zůstat float, int by je zničil (jsou < 1)
+    for col in df.select_dtypes(include=['float64']).columns:
+        df[col] = df[col].astype('float32')
+
+    return df
 
 def run_training(sales_csv, guests_csv, params_json_path):
     try:
@@ -90,20 +106,18 @@ def run_training(sales_csv, guests_csv, params_json_path):
         df_sales = pd.read_csv(sales_csv)
         df_guests = pd.read_csv(guests_csv)
 
-        if 'ds' in df_sales.columns: df_sales['ds'] = pd.to_datetime(df_sales['ds'])
-        if 'ds' in df_guests.columns: df_guests['ds'] = pd.to_datetime(df_guests['ds'])
+        # [OPTIMALIZACE] Přetypování pro úsporu paměti a zrychlení přenosu
+        df_sales = optimize_types(df_sales)
+        df_guests = optimize_types(df_guests)
 
-        print(json.dumps({"type": "status", "msg": "⚙️ Sestavuji model..."}), flush=True)
+        print(json.dumps({"type": "status", "msg": "⚙️ Sestavuji model (Batch: " + str(best_params.get('batch_size', '?')) + ")..."}), flush=True)
 
         model = ForecastModel(best_params=best_params)
-
-        # Získáme informaci o max_steps z configu nebo params
-        total_steps = best_params.get('max_steps', config.TFT_PARAMS['max_steps'])
 
         model.train(
             df_sales,
             df_guests,
-            ui_callback_cls=JSONLoggerCallback, # Použijeme náš vylepšený logger
+            ui_callback_cls=JSONLoggerCallback,
             ui_container=DummyContainer()
         )
 
