@@ -38,7 +38,7 @@ TFT_PARAMS = {
     'early_stop_patience_steps': 10,
     'learning_rate': 0.0005,
     'hidden_size': 128,
-    'batch_size': 256,
+    'batch_size': 128,
     'scaler_type': 'robust',
     'dropout': 0.15,
     'attn_head_size': 4,

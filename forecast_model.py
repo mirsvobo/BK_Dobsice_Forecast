@@ -40,24 +40,28 @@ class ForecastModel:
     def _build_model(self, callbacks=None):
         """
         Sestaví instanci modelu TFT.
-        Pokud jsou předány callbacks (např. pro Streamlit UI), vloží je do trainer_kwargs.
         """
         # --- Definice parametrů pro Trainer ---
         trainer_args = {
             'max_steps': self.params['max_steps'],
             'accelerator': self.accelerator,
+            'precision': '16-mixed', # Využije Tensor Cores na RTX kartách
+
+            # [OPTIMALIZACE] Gradient Accumulation
+            # Fyzická batch 128 se vejde do VRAM. Akumulujeme 4x => Efektivní batch 512.
+            # Zvyšuje stabilitu učení a snižuje zátěž paměti.
+            'accumulate_grad_batches': 4,
+
             'enable_model_summary': False,
-            'enable_progress_bar': False, # Vypneme defaultní konzolový bar, máme vlastní UI
+            'enable_progress_bar': False,
             'check_val_every_n_epoch': 100,
-            'callbacks': callbacks if callbacks else [] # Zde vkládáme náš StreamlitCallback
+            'callbacks': callbacks if callbacks else []
         }
 
         # --- Inicializace modelu TFT ---
         tft_model = TFT(
             h=self.params['h'],
             input_size=self.params['input_size'],
-
-            # Parametry modelu
             hidden_size=self.params['hidden_size'],
             learning_rate=self.params['learning_rate'],
             scaler_type=self.params['scaler_type'],
@@ -67,16 +71,17 @@ class ForecastModel:
             futr_exog_list=config.FUTR_EXOG_LIST,
             alias='TFT_Model',
 
-            # Early Stopping (Model level)
+            # [OPTIMALIZACE] Windows Fix:
+            # Nastavení na 0 odstraní režii s vytvářením procesů a kopírováním paměti.
+            # Na Windows to často zrychlí start epochy o sekundy.
+            num_workers_loader=0,
+            drop_last_loader=False,
+
             early_stop_patience_steps=self.params['early_stop_patience_steps']
         )
 
-        # --- Ruční přiřazení trainer_kwargs ---
         tft_model.trainer_kwargs = trainer_args
-
-        # Windows Fix
-        tft_model.num_workers_loader = 0
-        tft_model.drop_last_loader = False
+        tft_model.trainer_kwargs['gradient_clip_val'] = 0.5
 
         return tft_model
 

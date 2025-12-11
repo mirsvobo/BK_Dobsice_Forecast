@@ -45,10 +45,22 @@ class DataLoader:
         for col in ['y_sales', 'y_guests']:
             if col in df.columns:
                 if df[col].dtype == object:
-                    df[col] = df[col].astype(str).str.replace(',', '.')
+                    # Odstraníme čárky i mezery (např. "1 200")
+                    df[col] = df[col].astype(str).str.replace(',', '.').str.replace(' ', '')
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
             else:
                 df[col] = 0.0
+
+        # --- [FIX] SANITIZACE DAT (Záporná čísla rozbíjejí TFT) ---
+        # Záporné prodeje (vratky) ořízneme na 0, jinak model diverguje (MAE: inf)
+        num_neg_sales = (df['y_sales'] < 0).sum()
+        if num_neg_sales > 0:
+            print(f"⚠️ VAROVÁNÍ: Nalezeno {num_neg_sales} řádků se zápornými tržbami. Ořezávám na 0.")
+            df['y_sales'] = df['y_sales'].clip(lower=0.0)
+
+        # To samé pro hosty (logicky nemůže být záporný počet hostů)
+        df['y_guests'] = df['y_guests'].clip(lower=0.0)
+        # -----------------------------------------------------------
 
         # 3. AGREGACE NA DNY
         print("INFO: Agreguji data na denní úroveň...")

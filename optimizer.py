@@ -3,6 +3,7 @@ import pandas as pd
 import multiprocessing
 import logging
 import importlib
+import math
 import config
 
 # Potlačení logů
@@ -17,34 +18,29 @@ class ModelOptimizer:
 
     def objective(self, trial):
         # Importujeme worker až TADY a vynutíme reload (pro Windows multiprocessing)
-        # To zajistí, že změny v kódu workeru se projeví i bez restartu Streamlitu
         import worker
         importlib.reload(worker)
 
-        # 1. Návrh parametrů (Search Space)
+        # 1. Návrh parametrů
         params = {
-            # Proměnné (hledané) parametry
-            "learning_rate": trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
+            # [FIX] Learning rate - bezpečnější rozsah
+            "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
             "dropout": trial.suggest_float("dropout", 0.1, 0.4),
 
-            # Fixní parametry (Výkonnostní metriky z Configu)
+            # Fixní parametry z Configu
             "hidden_size": config.TFT_PARAMS['hidden_size'],
             "batch_size": config.TFT_PARAMS['batch_size'],
             "attn_head_size": config.TFT_PARAMS['attn_head_size'],
             "input_size": config.TFT_PARAMS['input_size'],
-
-            # Pro optimalizaci používáme stejný počet kroků jako v configu
             "max_steps": config.TFT_PARAMS['max_steps']
         }
 
-        # 2. Serializace dat (DataFrame -> Dict) pro přenos do procesu
+        # 2. Serializace dat
         train_data_dict = self.train_df.to_dict(orient='list')
 
-        # 3. Spuštění workeru (Izolovaný proces kvůli memory leakům a stabilitě)
+        # 3. Spuštění workeru (Izolovaný proces)
         queue = multiprocessing.Queue()
-
-        # Windows vyžaduje 'spawn'
-        ctx = multiprocessing.get_context('spawn')
+        ctx = multiprocessing.get_context('spawn') # Nutné pro Windows
 
         process = ctx.Process(
             target=worker.train_process_worker,
@@ -52,42 +48,54 @@ class ModelOptimizer:
         )
 
         process.start()
-        process.join() # Čekáme na dokončení procesu
+        process.join() # Čekáme na dokončení
 
-        # 4. Získání výsledku z fronty
+        # 4. Získání výsledku
+        # [FIX] Penalizace nastavena na 1 miliardu, aby ji Optuna ignorovala
+        penalty_score = 1_000_000_000.0
+
         if not queue.empty():
             result = queue.get()
+
+            # --- DEBUG VÝPISY DO KONZOLE ---
+            if result['status'] == 'error':
+                print(f"❌ CHYBA WORKERU (Trial {trial.number}): {result['message']}")
+                return penalty_score
+            # -------------------------------
+
             if result['status'] == 'ok':
-                return result['mae']
+                mae = result['mae']
+
+                # [FIX] Ochrana proti NaN / Inf
+                if mae is None or math.isnan(mae) or math.isinf(mae):
+                    print(f"⚠️ VAROVÁNÍ (Trial {trial.number}): Model vrátil NaN/Inf.")
+                    return penalty_score
+
+                # [FIX] Ochrana proti explozi gradientů
+                if mae > penalty_score:
+                    print(f"⚠️ VAROVÁNÍ (Trial {trial.number}): MAE je příliš vysoké ({mae}).")
+                    return penalty_score
+
+                print(f"✅ OK (Trial {trial.number}): MAE = {mae:.4f}")
+                return float(mae)
             else:
-                # Pokud to spadne (např. OOM), vrátíme "nekonečno", aby to Optuna zahodila
-                return float('inf')
+                return penalty_score
         else:
-            return float('inf')
+            print(f"❌ KRITICKÁ CHYBA (Trial {trial.number}): Worker neodpověděl (Crash/SegFault).")
+            return penalty_score
 
     def optimize(self, streamlit_callback=None):
-        """
-        Spustí optimalizaci.
-
-        Args:
-            streamlit_callback: Instance OptunaStreamlitCallback pro vizualizaci.
-        """
         print(f"INFO: Spouštím optimalizaci (Optuna)...")
-        print(f"      Fixované parametry: BS={config.TFT_PARAMS['batch_size']}, Hidden={config.TFT_PARAMS['hidden_size']}")
 
-        # Příprava callbacků pro Optunu
         callbacks = []
         if streamlit_callback:
             callbacks.append(streamlit_callback)
 
         study = optuna.create_study(direction="minimize")
-
-        # Spuštění optimalizace (blokující operace)
         study.optimize(self.objective, n_trials=self.n_trials, callbacks=callbacks)
 
         print(f"INFO: Nejlepší parametry: {study.best_params}")
 
-        # Do výsledku vrátíme i ty fixní parametry, aby je ForecastModel mohl použít
         best = study.best_params.copy()
         best.update({
             'hidden_size': config.TFT_PARAMS['hidden_size'],
