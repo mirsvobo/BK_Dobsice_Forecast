@@ -1,171 +1,143 @@
 import pandas as pd
 import numpy as np
-import torch
 import os
-import gc
 import shutil
-import config
 from neuralforecast import NeuralForecast
-from neuralforecast.models import TFT
-from neuralforecast.losses.pytorch import HuberMQLoss
-from hierarchicalforecast.core import HierarchicalReconciliation
-from hierarchicalforecast.methods import BottomUp
-import logging
-import warnings
-
-# Suppress warnings
-logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
-warnings.filterwarnings('ignore')
-
-# --- GPU OPTIMIZATIONS ---
-# Enables usage of Tensor Cores on Nvidia GPUs (Ampere/Volta/Turing)
-torch.set_float32_matmul_precision('medium')
+from neuralforecast.models import NHITS
+from neuralforecast.losses.pytorch import MAE
 
 class ForecastModel:
-    def __init__(self, best_params=None):
+    def __init__(self):
         self.nf_sales = None
         self.nf_guests = None
-        self.reconciler = HierarchicalReconciliation(reconcilers=[BottomUp()])
 
-        self.params = config.TFT_PARAMS.copy()
-        if best_params:
-            self.params.update(best_params)
+        # --- KONFIGURACE ---
+        self.config = {
+            "max_steps": 2500,           # Dostatek kroků pro učení
+            "learning_rate": 0.0005,     # Přesnější učení
+            "batch_size": 4096,          # ⚠️ Bezpečná hodnota pro VRAM i při delším horizontu
+            "val_check_steps": 100,
+            "early_stop_patience_steps": 30,
+            "scaler_type": 'standard',
+            "enable_progress_bar": False
+        }
 
-        self.loss = HuberMQLoss(quantiles=[0.1, 0.5, 0.9], delta=1.0)
-
-        # Detect Hardware
-        self.accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-        self.device_id = [0] if torch.cuda.is_available() else "auto"
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            print(f"   [ForecastModel] USING GPU: {torch.cuda.get_device_name(0)}")
-            print(f"   [ForecastModel] Mixed Precision ENABLED (Speed Boost)")
-
-    def _build_model(self):
+    def train(self, sales_df, guests_df, horizon, callbacks_sales=None, callbacks_guests=None):
         """
-        Production-ready TFT configuration.
+        Trénuje model na specifický horizont (počet dní).
         """
-        tft_model = TFT(
-            h=self.params['h'],
-            input_size=self.params['input_size'],
-            hidden_size=self.params['hidden_size'],
-            learning_rate=self.params['learning_rate'],
-            scaler_type=self.params['scaler_type'],
-            batch_size=self.params['batch_size'],
-            dropout=self.params['dropout'],
-            loss=self.loss,
-            futr_exog_list=config.FUTR_EXOG_LIST,
-            alias='TFT_Model',
+        print(f"🚀 Začínám trénink na {horizon} dní (Batch={self.config['batch_size']})...")
 
-            # --- PERFORMANCE TUNING ---
-            max_steps=self.params['max_steps'],
-            accelerator=self.accelerator,
-            # '16-mixed' is crucial for RTX cards speedup
-            precision='16-mixed' if self.accelerator == 'gpu' else '32',
+        # Input size (kolik historie vidí) = 3x horizont
+        input_size = 3 * horizon
 
-            # Disable validation loop during training for pure speed
-            limit_val_batches=0,
-            num_sanity_val_steps=0,
+        # --- 1. MODEL TRŽBY ---
+        if callbacks_sales:
+            sales_std = sales_df['y'].std()
+            for cb in callbacks_sales:
+                cb.y_std = sales_std
 
-            # Reduce logging overhead
-            enable_model_summary=False,
-            enable_progress_bar=True,
-            enable_checkpointing=False,
-            logger=False,
+        models_sales = [
+            NHITS(
+                h=horizon,               # Nastavíme horizont dynamicky
+                input_size=input_size,
+                loss=MAE(),
+                callbacks=callbacks_sales if callbacks_sales else [],
+                **self.config
+            )
+        ]
 
-            # Windows DataLoader Safety (Must be 0 on Windows usually)
-            num_workers_loader=0,
-            random_seed=42
-        )
-        return tft_model
+        self.nf_sales = NeuralForecast(models=models_sales, freq='D')
+        self.nf_sales.fit(df=sales_df, val_size=horizon)
 
-    def train(self, df_sales, df_guests):
-        # Clean potential previous run garbage
-        gc.collect()
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        # --- 2. MODEL HOSTÉ ---
+        if callbacks_guests:
+            guests_std = guests_df['y'].std()
+            for cb in callbacks_guests:
+                cb.y_std = guests_std
 
-        print("\n--- TRÉNINK MODELŮ (TFT) ---")
+        models_guests = [
+            NHITS(
+                h=horizon,               # Nastavíme horizont dynamicky
+                input_size=input_size,
+                loss=MAE(),
+                callbacks=callbacks_guests if callbacks_guests else [],
+                **self.config
+            )
+        ]
 
-        # 1. SALES
-        print(f" > Trénuji TRŽBY (Horizon: {self.params['h']} dní)...")
-        model_sales = self._build_model()
-        self.nf_sales = NeuralForecast(models=[model_sales], freq=config.FREQ)
-        self.nf_sales.fit(df=df_sales)
-        del model_sales
+        self.nf_guests = NeuralForecast(models=models_guests, freq='D')
+        self.nf_guests.fit(df=guests_df, val_size=horizon)
 
-        # 2. GUESTS
-        print(f" > Trénuji HOSTY (Horizon: {self.params['h']} dní)...")
-        model_guests = self._build_model()
-        self.nf_guests = NeuralForecast(models=[model_guests], freq=config.FREQ)
-        self.nf_guests.fit(df=df_guests)
-        del model_guests
+        print("✅ Trénink dokončen.")
 
-        gc.collect()
+    def predict(self, future_df_with_weather, S=None, tags=None):
+        if self.nf_sales is None or self.nf_guests is None:
+            raise ValueError("Modely nejsou natrénované!")
 
-    def predict(self, future_df, S, tags):
-        print("INFO: Generuji predikce...")
-        # Sales Prediction
-        p_sales = self.nf_sales.predict(futr_df=future_df)
-        p_sales = self._rename_output_columns(p_sales)
+        # Model si sám vytvoří dataframe o délce svého horizontu 'h'
+        futr_sales = self.nf_sales.make_future_dataframe()
 
-        # Guests Prediction
-        p_guests = self.nf_guests.predict(futr_df=future_df)
-        p_guests = self._rename_output_columns(p_guests)
+        # Připojíme počasí
+        # (Ošetření: weather data musí pokrývat celou dobu)
+        weather_data = future_df_with_weather.drop(columns=['unique_id'], errors='ignore').drop_duplicates('ds')
+        futr_sales = futr_sales.merge(weather_data, on='ds', how='left')
 
-        # Hierarchical Reconciliation
-        print("INFO: Probíhá rekonsiliace (Bottom-Up)...")
-        final_sales = self._reconcile_detailed(p_sales, S, tags)
-        final_guests = self._reconcile_detailed(p_guests, S, tags)
+        preds_sales = self.nf_sales.predict(futr_df=futr_sales)
 
-        return final_sales, final_guests
+        # Totéž pro hosty
+        futr_guests = self.nf_guests.make_future_dataframe()
+        futr_guests = futr_guests.merge(weather_data, on='ds', how='left')
+        preds_guests = self.nf_guests.predict(futr_df=futr_guests)
 
-    def _rename_output_columns(self, df):
-        cols = df.columns
-        # Locate quantiles dynamically
-        col_median = next((c for c in cols if 'median' in c or '0.5' in c), 'TFT_Model')
-        col_lo = next((c for c in cols if 'lo' in c or '0.1' in c), None)
-        col_hi = next((c for c in cols if 'hi' in c or '0.9' in c), None)
+        def get_model_col(df):
+            candidates = [c for c in df.columns if c not in ['ds', 'unique_id', 'y']]
+            return candidates[0] if candidates else None
 
-        mapping = {col_median: 'Forecast_Value'}
-        if col_lo: mapping[col_lo] = 'y_pred_low'
-        if col_hi: mapping[col_hi] = 'y_pred_high'
-        return df.rename(columns=mapping)
+        col_sales = get_model_col(preds_sales)
+        col_guests = get_model_col(preds_guests)
 
-    def _reconcile_detailed(self, preds_df, S, tags):
-        preds_clean = preds_df.reset_index()
-        cols_to_process = ['Forecast_Value', 'y_pred_low', 'y_pred_high']
-        final_df = preds_clean[['unique_id', 'ds']].copy()
+        preds_sales['Forecast_Value'] = preds_sales[col_sales]
+        preds_guests['Forecast_Value'] = preds_guests[col_guests]
 
-        for col in cols_to_process:
-            if col not in preds_clean.columns: continue
-
-            # Prepare format for HierarchicalForecast
-            temp_hat = preds_clean[['unique_id', 'ds', col]].rename(columns={col: 'yhat'}).set_index('unique_id')
-
-            try:
-                rec = self.reconciler.reconcile(Y_hat_df=temp_hat, S=S, tags=tags)
-                # Find the reconciled column (usually ends with /BottomUp)
-                out_col = [c for c in rec.columns if 'BottomUp' in c][-1]
-                rec = rec.reset_index().rename(columns={out_col: col})
-
-                final_df = pd.merge(final_df, rec[['unique_id', 'ds', col]], on=['unique_id', 'ds'], how='left')
-            except Exception as e:
-                # Fallback if reconciliation fails
-                final_df = pd.merge(final_df, preds_clean[['unique_id', 'ds', col]], on=['unique_id', 'ds'], how='left')
-
-        return final_df
+        return preds_sales, preds_guests
 
     def save_model(self, path):
-        if os.path.exists(path): shutil.rmtree(path)
+        if os.path.exists(path):
+            # Pro jistotu smažeme staré, aby se nepomíchaly verze
+            shutil.rmtree(path)
         os.makedirs(path)
-        self.nf_sales.save(path + "/sales", save_dataset=False, overwrite=True)
-        self.nf_guests.save(path + "/guests", save_dataset=False, overwrite=True)
 
-    def load_model(self, path):
-        try:
-            self.nf_sales = NeuralForecast.load(path + "/sales")
-            self.nf_guests = NeuralForecast.load(path + "/guests")
-            return True
-        except:
+        self.nf_sales.save(os.path.join(path, "sales_model"), overwrite=True)
+        self.nf_guests.save(os.path.join(path, "guests_model"), overwrite=True)
+        print(f"💾 Modely uloženy do {path}")
+
+    def load_model(self, path, required_horizon):
+        """
+        Načte model jen pokud existuje A pokud má dostatečný horizont.
+        """
+        sales_path = os.path.join(path, "sales_model")
+        guests_path = os.path.join(path, "guests_model")
+
+        if os.path.exists(sales_path) and os.path.exists(guests_path):
+            try:
+                print("📂 Kontroluji uložené modely...")
+                temp_sales = NeuralForecast.load(sales_path)
+
+                # ZJISTÍME HORIZONT ULOŽENÉHO MODELU
+                # NeuralForecast drží seznam modelů, vezmeme první
+                stored_h = temp_sales.models[0].h
+
+                if stored_h < required_horizon:
+                    print(f"⚠️ Uložený model má krátký horizont ({stored_h} dní). Požadováno {required_horizon}. Je nutný přetrénink.")
+                    return False
+
+                self.nf_sales = temp_sales
+                self.nf_guests = NeuralForecast.load(guests_path)
+                print(f"✅ Modely načteny (Horizont: {stored_h} dní).")
+                return True
+            except Exception as e:
+                print(f"⚠️ Chyba při načítání modelu: {e}")
+                return False
+        else:
             return False
