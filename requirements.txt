@@ -12,14 +12,6 @@ mlforecast
 hierarchicalforecast
 neuralforecast
 torch
-torchaudio
-torchvideo
 optuna
-pydantic
-transformers
-accelerate
-sentencepiece
-protobuf
 streamlit
 plotly
-sympy
